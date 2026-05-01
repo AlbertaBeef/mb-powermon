@@ -2,7 +2,7 @@
 
 Power and temperature measurement utility for edge AI NPUs.
 
-![](images/mb-powermon-hailo8-resnet50.gif)
+![](assets/mb-powermon-hailo8-resnet50.gif)
 
 `mb-powermon` is an [NVTOP](https://github.com/Syllo/nvtop)-style terminal monitor for AI accelerator boards and external power-measurement hardware. It runs anywhere a terminal does — no X server, no GUI — and shows per-device identity, PCIe link state, temperatures, and power as scrolling time-series graphs.
 
@@ -77,6 +77,8 @@ Each device renders as a panel with:
 The `--csv` and `--once` outputs include the full per-rail PMD2 snapshot and per-sensor INA228 voltage/current, which the TUI omits to keep panels readable.
 
 ## Plotting CSV runs
+
+![](assets/mb-powermon-hailo8-resnet50.html)
 
 `csv-to-html-plot.py` turns an mb-powermon CSV into a self-contained HTML file with two [Chart.js](https://www.chartjs.org/) plots — power and temperature, one trace per `<device>_POW / _TEMP / _TS0 / _TS1` column. The output works offline (Chart.js loads from a CDN; cache the page once and it renders without network access).
 
