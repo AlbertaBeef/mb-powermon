@@ -78,7 +78,7 @@ The `--csv` and `--once` outputs include the full per-rail PMD2 snapshot and per
 
 ## Plotting CSV runs
 
-![](assets/mb-powermon-hailo8-resnet50.html)
+[HTML plot](https://raw.githack.com/AlbertaBeef/mb-powermon/main/assets/mb-powermon-hailo8-resnet50.html)
 
 `csv-to-html-plot.py` turns an mb-powermon CSV into a self-contained HTML file with two [Chart.js](https://www.chartjs.org/) plots — power and temperature, one trace per `<device>_POW / _TEMP / _TS0 / _TS1` column. The output works offline (Chart.js loads from a CDN; cache the page once and it renders without network access).
 
