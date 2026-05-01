@@ -2,6 +2,8 @@
 
 Power and temperature measurement utility for edge AI NPUs.
 
+![](images/mb-powermon-hailo8-resnet50.gif)
+
 `mb-powermon` is an [NVTOP](https://github.com/Syllo/nvtop)-style terminal monitor for AI accelerator boards and external power-measurement hardware. It runs anywhere a terminal does — no X server, no GUI — and shows per-device identity, PCIe link state, temperatures, and power as scrolling time-series graphs.
 
 ## Supported devices
@@ -93,7 +95,8 @@ For long captures the script applies min-max bucket downsampling (preserving pea
 
 ## Acknowledgements
 
-Inspired by [NVTOP](https://github.com/Syllo/nvtop). PMD2 protocol cribbed from [ElmorLabs/PMD2-Python](https://github.com/ElmorLabs/PMD2-Python).
+Inspired by [NVTOP](https://github.com/Syllo/nvtop). 
+PMD2 support from [ElmorLabs/PMD2-Python](https://github.com/ElmorLabs/PMD2-Python).
 
 ## License
 
