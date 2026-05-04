@@ -14,6 +14,7 @@ Recognized CSV columns:
     <device>_POW                — power reading in watts
     <device>_TEMP               — temperature reading in celsius
     <device>_TS0, <device>_TS1  — on-die thermal sensor readings (Hailo-style)
+    <device>_PCIE1/PCIE2/PCIE3  — ElmorLabs PMD2 PCIe rail power readings (watts)
     adafruit-ft232h_*           — adafruit FT232H power channels
 
 Anything else is silently skipped (with a stderr warning).
@@ -44,6 +45,13 @@ DEVICE_COLORS = {
 FALLBACK_PALETTE = ["#534AB7", "#3478C2", "#A53860",
                     "#5C8001", "#8E44AD", "#D4A017"]
 
+# PMD2 rail colors — distinct so PCIE1/2/3 don't collapse to a single hue.
+RAIL_COLORS = {
+    "pcie1": "#534AB7",
+    "pcie2": "#3478C2",
+    "pcie3": "#A53860",
+}
+
 LOG_OVERLAY_COLOR = "#BA7517"
 
 
@@ -52,7 +60,10 @@ LOG_OVERLAY_COLOR = "#BA7517"
 # ---------------------------------------------------------------------------
 
 # Matches column names like "0000:c6:00.0_POW" or "device_TS0".
-_METRIC_RE = re.compile(r"^(.+?)_(POW|TEMP|TS0|TS1)$")
+_METRIC_RE = re.compile(r"^(.+?)_(POW|TEMP|TS0|TS1|PCIE1|PCIE2|PCIE3)$")
+
+# Power-like metric kinds (plotted on the power chart).
+_POWER_KINDS = {"pow", "pcie1", "pcie2", "pcie3"}
 
 
 def parse_header(header):
@@ -260,6 +271,8 @@ def assign_log_overlays(log_summaries, rows, columns, t0):
 def get_color(device, kind):
     if device in DEVICE_COLORS:
         return DEVICE_COLORS[device].get(kind, FALLBACK_PALETTE[0])
+    if kind in RAIL_COLORS:
+        return RAIL_COLORS[kind]
     return FALLBACK_PALETTE[abs(hash(device)) % len(FALLBACK_PALETTE)]
 
 
@@ -273,7 +286,7 @@ def build_datasets(rows, columns, overlays, t0, bucket_size):
     for dev, met, idx, raw_name in columns:
         series = build_series(rows, idx, t0, bucket_size)
         color = get_color(dev, met)
-        if met == "pow":
+        if met in _POWER_KINDS:
             dash = [6, 4] if is_pci_device(dev) else [2, 3] if not dev.startswith("adafruit") else []
             power.append({
                 "label": raw_name, "data": series,
