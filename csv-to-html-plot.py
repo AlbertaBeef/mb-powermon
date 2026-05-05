@@ -175,8 +175,14 @@ def build_series(rows, col_idx, t0, bucket_size):
 # Active-phase detection (used to place log overlays)
 # ---------------------------------------------------------------------------
 
-def detect_active_phases(rows, col_idx, t0, threshold=1.5):
-    """Find continuous regions where column value exceeds threshold."""
+def detect_active_phases(rows, col_idx, t0, threshold=1.0):
+    """Find continuous regions where column value exceeds threshold.
+
+    Default threshold is 1.0 W: above Hailo idle (~0.55 W) but below the
+    HW-latency phase's bursty floor (~1.2 W), so all three hailortcli
+    sub-phases are captured when present. Override via --phase-threshold
+    if your accelerator has a different idle/active separation.
+    """
     phases = []
     in_phase = False
     start_t = None
@@ -228,14 +234,115 @@ def parse_log(path):
     return summaries
 
 
-def assign_log_overlays(log_summaries, rows, columns, t0):
-    """
-    Match each log summary to a streaming-phase window in the CSV.
+def _phase_mean_power(rows, col_idx, t0, t_start, t_end):
+    """Mean of valid power samples within [t_start, t_end] (seconds since t0)."""
+    total = 0.0
+    n = 0
+    for r in rows:
+        if not r:
+            continue
+        try:
+            t = (parse_timestamp(r[0]) - t0).total_seconds()
+        except (ValueError, IndexError):
+            continue
+        if t < t_start or t > t_end:
+            continue
+        v = safe_float(r[col_idx]) if col_idx < len(r) else None
+        if v is not None:
+            total += v
+            n += 1
+    return total / n if n else None
 
-    The hailortcli benchmark runs three sub-phases per invocation
-    (HW-only, streaming, HW-latency). When N invocations on a device
-    produce 3*N detected active phases, the streaming phase is the
-    middle one of each triple.
+
+def _pick_streaming_phase(rows, col, t0, cluster, log_entry, subphase_dur):
+    """Choose the streaming sub-phase out of an invocation cluster.
+
+    `hailortcli benchmark` runs three sub-phases in fixed order — HW-only,
+    streaming, HW-latency. They typically appear in the CSV as 3 distinct
+    active phases, but two non-canonical cases come up often:
+
+      - **HW-only + streaming merged** into one long phase. Hailo doesn't
+        power-cycle the chip across that firmware mode change, so unless
+        a sample happens to land in the brief inter-mode dip the two
+        sustained-busy cycles fuse into one ~30 s phase. Streaming is
+        the second half.
+      - **HW-latency below threshold** (Hailo's HW-latency draws ~1.2 W,
+        very close to the active-phase threshold). When that's the case
+        we either see 2 phases (HW-only, streaming) or 1 phase (those two
+        merged); HW-latency just doesn't show up.
+
+    The picker dispatches on cluster size:
+
+      - 3 phases: middle one (canonical).
+      - 2 phases:
+          * If their mean powers differ by >2× → one is bursty HW-latency,
+            the other is HW-only+streaming merged; pick second half of
+            the merged phase.
+          * Else both are sustained-busy → HW-only and streaming (HW-
+            latency missed); streaming is the *later* one (hailortcli's
+            fixed run order).
+      - 1 phase:
+          * Duration > 1.5 × `subphase_dur` → HW-only+streaming merged;
+            return the second half.
+          * Otherwise return as-is (unusual single-sub-phase capture).
+      - 4+ phases: pick the one whose mean is closest to the log's avg.
+    """
+    n = len(cluster)
+    if n == 3:
+        return cluster[1]
+
+    if n == 2:
+        a, b = cluster
+        ma = _phase_mean_power(rows, col, t0, a[0], a[1])
+        mb = _phase_mean_power(rows, col, t0, b[0], b[1])
+        if ma is not None and mb is not None and min(ma, mb) > 0:
+            ratio = max(ma, mb) / min(ma, mb)
+            if ratio > 2.0:
+                # One bursty (HW-latency), one busy (HW-only+streaming
+                # merged). Streaming is the second half of the busy one.
+                merged = a if ma > mb else b
+                m_dur = merged[1] - merged[0]
+                return (merged[0] + m_dur / 2.0, merged[1])
+        # Both sustained-busy: HW-only first, streaming second.
+        return b
+
+    if n == 1:
+        a = cluster[0]
+        dur = a[1] - a[0]
+        if dur > 1.5 * subphase_dur:
+            # Merged HW-only + streaming; streaming is the second half.
+            return (a[0] + dur / 2.0, a[1])
+        return a
+
+    # 4+ phases: fall back to mean-magnitude match against log's avg.
+    target = log_entry["avg"]
+    best = None
+    best_err = float("inf")
+    for sub_ts, sub_te in cluster:
+        m = _phase_mean_power(rows, col, t0, sub_ts, sub_te)
+        if m is None:
+            continue
+        e = abs(m - target)
+        if e < best_err:
+            best_err = e
+            best = (sub_ts, sub_te)
+    return best if best is not None else cluster[len(cluster) // 2]
+
+
+def assign_log_overlays(log_summaries, rows, columns, t0,
+                        cluster_gap=10.0, subphase_dur=15.0,
+                        threshold=None):
+    """
+    Place each log entry on the streaming sub-phase of its invocation.
+
+    Procedure:
+      1) Detect active power phases per device (above `threshold`, or the
+         function's own default if None).
+      2) Group temporally-close phases into invocation clusters
+         (sub-phases sit ~1-3 s apart; invocations sit much further apart,
+         controlled by `cluster_gap`).
+      3) For each cluster, pick the streaming sub-phase via
+         `_pick_streaming_phase` (handles 1/2/3/4+ phase shapes).
     """
     overlays = []
     power_cols = {dev: idx for dev, met, idx, _ in columns if met == "pow"}
@@ -245,20 +352,38 @@ def assign_log_overlays(log_summaries, rows, columns, t0):
             print(f"warning: log mentions {device} but no _POW column found in CSV",
                   file=sys.stderr)
             continue
-        phases = detect_active_phases(rows, power_cols[device], t0)
-        n_e, n_p = len(entries), len(phases)
-
-        if n_p == 3 * n_e:
-            picks = [phases[3 * k + 1] for k in range(n_e)]
-        elif n_p >= n_e:
-            step = max(1, n_p // n_e)
-            picks = [phases[min(k * step + step // 2, n_p - 1)] for k in range(n_e)]
+        col = power_cols[device]
+        if threshold is None:
+            phases = detect_active_phases(rows, col, t0)
         else:
-            print(f"warning: {n_e} log entries for {device} vs only {n_p} active phases; "
-                  f"skipping overlays for this device", file=sys.stderr)
+            phases = detect_active_phases(rows, col, t0, threshold=threshold)
+        if not phases:
+            print(f"warning: {device} has {len(entries)} log entr(y/ies) "
+                  f"but no active phases detected; skipping",
+                  file=sys.stderr)
             continue
 
-        for entry, (ts, te) in zip(entries, picks):
+        # Cluster phases by temporal gap to recover invocation boundaries.
+        clusters = [[phases[0]]]
+        for ts, te in phases[1:]:
+            if ts - clusters[-1][-1][1] < cluster_gap:
+                clusters[-1].append((ts, te))
+            else:
+                clusters.append([(ts, te)])
+
+        if len(clusters) < len(entries):
+            print(f"warning: {device} has {len(entries)} log entr(y/ies) "
+                  f"but only {len(clusters)} invocation cluster(s); some "
+                  f"markers may be misplaced — try lowering --invocation-gap",
+                  file=sys.stderr)
+        elif len(clusters) > len(entries):
+            print(f"info: {device} detected {len(clusters)} cluster(s) for "
+                  f"{len(entries)} log entr(y/ies); using the first "
+                  f"{len(entries)} in chronological order", file=sys.stderr)
+
+        for entry, cluster in zip(entries, clusters):
+            ts, te = _pick_streaming_phase(rows, col, t0, cluster,
+                                           entry, subphase_dur)
             overlays.append({"device": device, "t_start": ts, "t_end": te,
                              "avg": entry["avg"], "max": entry["max"]})
     return overlays
@@ -459,6 +584,26 @@ def main():
                         "(default: auto, 1 = disable)")
     p.add_argument("-t", "--title",
                    help="chart title (default: input filename stem)")
+    p.add_argument("--invocation-gap", type=float, default=10.0, metavar="SEC",
+                   help="seconds — gaps larger than this between active power "
+                        "phases mark a new hailortcli invocation boundary "
+                        "(default: 10.0). Lower if your invocations were "
+                        "back-to-back; raise if a single invocation has long "
+                        "idle dips between its 3 sub-phases.")
+    p.add_argument("--phase-threshold", type=float, default=None, metavar="W",
+                   help="power level (W) above which the device is considered "
+                        "running an active sub-phase (default: 1.0 — above "
+                        "Hailo idle ~0.55 W, below HW-latency floor ~1.2 W). "
+                        "Lower this if HW-latency isn't being detected as a "
+                        "third sub-phase; raise if idle-period noise is being "
+                        "misclassified as activity.")
+    p.add_argument("--subphase-duration", type=float, default=15.0, metavar="SEC",
+                   help="expected duration of a single hailortcli sub-phase "
+                        "(default: 15.0, the hailortcli `--time-to-run` "
+                        "default). Used to detect when HW-only and streaming "
+                        "have merged into one long phase: phases >1.5× this "
+                        "are split in half and the marker placed on the "
+                        "second half.")
     args = p.parse_args()
 
     output = args.output or str(Path(args.input).with_suffix(".html"))
@@ -478,7 +623,10 @@ def main():
     x_max = round(t_end + 1, 1)
 
     log_summaries = parse_log(args.log) if args.log else {}
-    overlays = assign_log_overlays(log_summaries, rows, columns, t0)
+    overlays = assign_log_overlays(log_summaries, rows, columns, t0,
+                                   cluster_gap=args.invocation_gap,
+                                   subphase_dur=args.subphase_duration,
+                                   threshold=args.phase_threshold)
 
     power_ds, temp_ds = build_datasets(rows, columns, overlays, t0, bucket_size)
     html = build_html(title, Path(args.input).name, power_ds, temp_ds, x_max)
