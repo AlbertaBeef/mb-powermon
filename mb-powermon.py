@@ -692,11 +692,33 @@ class AxeleraProbe:
         self._verbose = verbose
         self.history_max = history_max or self.HISTORY_MAX
 
-        self.history_temp = deque(maxlen=self.history_max)
+        # Metis exposes 5 readings in triton_trace's `core_temps=[...]`
+        # log line. Per Axelera's CONNECT documentation the order is:
+        #   index 0: Sys-core   (module/system-level sensor)
+        #   index 1: AI-core 0
+        #   index 2: AI-core 1
+        #   index 3: AI-core 2
+        #   index 4: AI-core 3
+        # We surface all five as separate metrics so the user can see
+        # the module-level temperature alongside per-core thermals.
+        self.history_t = [deque(maxlen=self.history_max) for _ in range(5)]
         self.history_power = deque(maxlen=self.history_max)
+        # SYS uses magenta (matches PMD2's TOTAL "aggregate" color
+        # convention); AI0..AI3 cycle through 4 distinct hues. POW
+        # stays cyan even though it's always None on Metis M.2 — kept
+        # so panels visually align with Hailo's POW slot.
+        _LABELS = ("SYS", "AI0", "AI1", "AI2", "AI3")
+        _COLORS = (CP_TRACE_TOTAL,  # SYS  magenta
+                   CP_TRACE_TEMP,   # AI0  yellow
+                   CP_OK,           # AI1  green
+                   CP_TRACE_POWER,  # AI2  cyan (POW empty on Metis,
+                                    #           so no clash)
+                   CP_CRIT)         # AI3  red
         self.metrics = [
-            Metric("POW",  self.history_power, "W", CP_TRACE_POWER),
-            Metric("TEMP", self.history_temp, "°C", CP_TRACE_TEMP),
+            Metric("POW", self.history_power, "W", CP_TRACE_POWER),
+        ] + [
+            Metric(_LABELS[i], self.history_t[i], "°C", _COLORS[i])
+            for i in range(5)
         ]
 
         self._open(sdk_device)
@@ -789,14 +811,16 @@ class AxeleraProbe:
                   f"device={self._device_name})")
 
     def poll(self):
-        temp = None
-        if self._collector_enabled:
-            temps = self._read_core_temps()
-            if temps:
-                temp = max(temps)
-        self.history_temp.append(temp)
+        # _read_core_temps() returns a list of integers parsed from the
+        # `core_temps=[a,b,c,d,e]` collector log line — typically 5 on
+        # Metis. We pad with None / truncate so each of the 5 deques
+        # gets exactly one sample per poll, matching Metric contract.
+        temps = self._read_core_temps() if self._collector_enabled else None
+        for i in range(5):
+            v = float(temps[i]) if (temps and i < len(temps)) else None
+            self.history_t[i].append(v)
         self.history_power.append(None)
-        return temp, None
+        return temps, None
 
     _peek_fail_count = 0
     _peek_fail_logged = False
@@ -844,7 +868,8 @@ class AxeleraProbe:
         return temps
 
     def reset_history(self):
-        self.history_temp.clear()
+        for d in self.history_t:
+            d.clear()
         self.history_power.clear()
 
     def close(self):

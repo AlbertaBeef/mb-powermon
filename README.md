@@ -11,7 +11,7 @@ Power and temperature measurement utility for edge AI NPUs.
 | Probe       | Hardware                                                                 | Metrics                                              |
 | ----------- | ------------------------------------------------------------------------ | ---------------------------------------------------- |
 | `hailo`     | Hailo-8 / 8L / 8R PCIe + M.2 modules                                     | `POW`, `TS0`, `TS1` (both on-die temperature sensors) |
-| `axelera`   | Axelera Metis M.2                                                        | `TEMP` (per-core max via `triton_trace`); power not exposed |
+| `axelera`   | Axelera Metis M.2                                                        | `SYS` (module/system PVT) + `AI0`–`AI3` (per-AIPU-core PVT) via `triton_trace`; power not exposed on M.2 |
 | `elmorlabs` | ElmorLabs PMD2 (USB CDC, VID:PID `0483:5740`)                            | `PCIE1/2/3`, `TOTAL`; 10 rails dumped in `--once`    |
 | `adafruit`  | Up to 4× Adafruit INA228 power monitors on an Adafruit FT232H USB→I²C bridge (`0403:6014`) | One `P<n>` trace per detected sensor; auto-classifies rail voltage (`P1` → `P1(3.3V)`) |
 
