@@ -10,12 +10,16 @@ Usage:
     python3 mb-powermon-plot.py -i data.csv [-l benchmark.log] [-o out.html]
 
 Recognized CSV columns:
-    time                        — ISO-format timestamp (required, first column)
-    <device>_POW                — power reading in watts
-    <device>_TEMP               — temperature reading in celsius
-    <device>_TS0, <device>_TS1  — on-die thermal sensor readings (Hailo-style)
-    <device>_PCIE1/PCIE2/PCIE3  — ElmorLabs PMD2 PCIe rail power readings (watts)
-    adafruit-ft232h_*           — adafruit FT232H power channels
+    time                          — ISO-format timestamp (required, first col)
+    <device>_POW                  — power reading (W)
+    <device>_TEMP                 — single temperature reading (°C)
+    <device>_TS0, _TS1            — Hailo on-die thermal sensors (°C)
+    <device>_T0, _T1, _T2, ...    — DeepX per-NPU temperatures (°C)
+    <device>_SYS                  — Axelera module/system PVT (°C)
+    <device>_AI0, _AI1, ...       — Axelera per-AIPU-core PVT (°C)
+    <device>_PCIE1, _PCIE2, ...   — PMD2 per-rail power (W)
+    <device>_TOTAL                — PMD2 aggregate power (W)
+    adafruit-ft232h_*             — Adafruit FT232H power channels (W)
 
 Anything else is silently skipped (with a stderr warning).
 """
@@ -59,11 +63,33 @@ LOG_OVERLAY_COLOR = "#BA7517"
 # CSV parsing
 # ---------------------------------------------------------------------------
 
-# Matches column names like "0000:c6:00.0_POW" or "device_TS0".
-_METRIC_RE = re.compile(r"^(.+?)_(POW|TEMP|TS0|TS1|PCIE1|PCIE2|PCIE3)$")
+# Matches column names like "0000:c6:00.0_POW", "device_TS0", "device_T2"
+# (DeepX per-NPU), "device_SYS" / "device_AI3" (Axelera per-core), or
+# "device_TOTAL" (PMD2 aggregate power).
+_METRIC_RE = re.compile(
+    r"^(.+?)_(POW|TEMP|TS\d+|T\d+|SYS|AI\d+|PCIE\d+|TOTAL)$"
+)
 
-# Power-like metric kinds (plotted on the power chart).
-_POWER_KINDS = {"pow", "pcie1", "pcie2", "pcie3"}
+
+def _classify_metric(met):
+    """Return 'power' or 'temp' for a metric kind, or None to skip.
+
+    Power-like (plotted on the power chart):
+        pow, total, pcieN (PMD2 per-rail), and adafruit-ft232h_PN power
+        channels handled in parse_header().
+    Temperature-like (plotted on the temperature chart):
+        temp, sys (Axelera module sensor), tsN (Hailo on-die), tN (DeepX
+        per-NPU), aiN (Axelera per-core).
+    """
+    if met in ("pow", "total"):
+        return "power"
+    if re.match(r"^pcie\d+$", met):
+        return "power"
+    if met in ("temp", "sys"):
+        return "temp"
+    if re.match(r"^(ts|t|ai)\d+$", met):
+        return "temp"
+    return None
 
 
 def parse_header(header):
@@ -394,11 +420,17 @@ def assign_log_overlays(log_summaries, rows, columns, t0,
 # ---------------------------------------------------------------------------
 
 def get_color(device, kind):
-    if device in DEVICE_COLORS:
-        return DEVICE_COLORS[device].get(kind, FALLBACK_PALETTE[0])
+    # Exact (device, kind) override — curated palette entries.
+    if device in DEVICE_COLORS and kind in DEVICE_COLORS[device]:
+        return DEVICE_COLORS[device][kind]
+    # Power-rail conventions (PMD2 PCIE1/2/3 etc.)
     if kind in RAIL_COLORS:
         return RAIL_COLORS[kind]
-    return FALLBACK_PALETTE[abs(hash(device)) % len(FALLBACK_PALETTE)]
+    # Fallback — hash on BOTH device and kind so a multi-sensor probe
+    # (DeepX T0/T1/T2, Axelera SYS+AI0..AI3) gets distinct colors per
+    # sensor even when the device isn't in DEVICE_COLORS. Hashing on
+    # device alone would collapse all sensors of one chip to one hue.
+    return FALLBACK_PALETTE[abs(hash((device, kind))) % len(FALLBACK_PALETTE)]
 
 
 def is_pci_device(name):
@@ -411,7 +443,8 @@ def build_datasets(rows, columns, overlays, t0, bucket_size):
     for dev, met, idx, raw_name in columns:
         series = build_series(rows, idx, t0, bucket_size)
         color = get_color(dev, met)
-        if met in _POWER_KINDS:
+        kind = _classify_metric(met)
+        if kind == "power":
             dash = [6, 4] if is_pci_device(dev) else [2, 3] if not dev.startswith("adafruit") else []
             power.append({
                 "label": raw_name, "data": series,
@@ -420,8 +453,12 @@ def build_datasets(rows, columns, overlays, t0, bucket_size):
                 "pointRadius": 0, "pointHoverRadius": 4,
                 "tension": 0.1, "spanGaps": True,
             })
-        elif met in ("temp", "ts0", "ts1"):
-            dash = [6, 4] if met == "ts1" else []
+        elif kind == "temp":
+            # Dash the "extra" sensor on multi-sensor probes so it's
+            # easy to disambiguate from the canonical one:
+            #   Hailo  TS1   — secondary of two thermal sensors
+            #   Axelera SYS  — module/system PVT, distinct from AI-cores
+            dash = [6, 4] if met in ("ts1", "sys") else []
             temp.append({
                 "label": raw_name, "data": series,
                 "borderColor": color, "backgroundColor": color,

@@ -12,6 +12,7 @@ Power and temperature measurement utility for edge AI NPUs.
 | ----------- | ------------------------------------------------------------------------ | ---------------------------------------------------- |
 | `hailo`     | Hailo-8 / 8L / 8R PCIe + M.2 modules                                     | `POW`, `TS0`, `TS1` (both on-die temperature sensors) |
 | `axelera`   | Axelera Metis M.2                                                        | `SYS` (module/system PVT) + `AI0`–`AI3` (per-AIPU-core PVT) via `triton_trace`; power not exposed on M.2 |
+| `deepx`     | DeepX M1 M.2 (PCI vendor `0x1ff4`)                                       | `T0`/`T1`/`T2` (per-NPU temperature) via `dxrt-cli -s`; power not exposed on M1 |
 | `elmorlabs` | ElmorLabs PMD2 (USB CDC, VID:PID `0483:5740`)                            | `PCIE1/2/3`, `TOTAL`; 10 rails dumped in `--once`    |
 | `adafruit`  | Up to 4× Adafruit INA228 power monitors on an Adafruit FT232H USB→I²C bridge (`0403:6014`) | One `P<n>` trace per detected sensor; auto-classifies rail voltage (`P1` → `P1(3.3V)`) |
 
@@ -52,6 +53,7 @@ python3 mb-powermon.py --verbose
 | ----------- | ------------------------------------------------------------------------ |
 | `hailo`     | [`hailo_platform`](https://hailo.ai/) (HailoRT runtime + Python bindings) |
 | `axelera`   | `axelera.runtime` Python package + the `triton_trace` binary (auto-located on `$PATH` or `/opt/axelera/runtime-*/bin`) |
+| `deepx`     | The `dxrt-cli` binary (DXRT 3.2.0+, auto-located on `$PATH` or `/usr/local/bin/dxrt-cli`) — telemetry only, no Python SDK needed for the probe |
 | `elmorlabs` | `pyserial`                                                               |
 | `adafruit`  | `adafruit-blinka`, `adafruit-circuitpython-ina228`, `pyftdi`             |
 

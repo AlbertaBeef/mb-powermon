@@ -24,6 +24,10 @@ Data sources
                 + triton_trace --slog --peek (per-core temperatures).
                 Power is not exposed on Metis M.2 so its trace stays
                 empty.
+- DeepX M1:     dxrt-cli -s parses per-NPU voltage/clock/temperature
+                from the DXRT runtime CLI (the dx_engine Python SDK
+                doesn't expose telemetry). 3 NPU cores → T0/T1/T2.
+                Power is not exposed on M1 so its trace stays empty.
 - ElmorLabs PMD2: USB CDC (VID:PID 0483:5740) via pyserial.
                 Reads total power and individual rails
                 (ATX12V, ATX5V, ATX5VSB, ATX3.3V, EPS, HPWR, PCIE2/3).
@@ -148,6 +152,10 @@ def _silence_fd_output():
 
 HAILO_PCI_VENDOR = "0x1e60"
 AXELERA_PCI_VENDOR = "0x1f9d"
+# DeepX (DEEPX Co., Ltd.) — vendor id 0x1ff4. Not yet in the public
+# PCI registry at firmware 2.5.0 / DXRT 3.2.0; matched by raw id rather
+# than by the "DEEPX" string in lspci output.
+DEEPX_PCI_VENDOR = "0x1ff4"
 SYSFS_PCI = "/sys/bus/pci/devices"
 
 
@@ -427,6 +435,47 @@ def _axelera_board_arch(board_type):
         return ""
     s = str(board_type).split(".")[-1].lower()
     return _AXELERA_BOARD_ARCH.get(s, s.upper() or "")
+
+
+def scan_sysfs_deepx():
+    """Return sorted list of BDFs whose PCI vendor id matches DeepX."""
+    found = []
+    for path in sorted(glob.glob(os.path.join(SYSFS_PCI, "*"))):
+        vendor = _read_sysfs(os.path.join(path, "vendor"))
+        if vendor and vendor.lower() == DEEPX_PCI_VENDOR:
+            found.append(os.path.basename(path))
+    return found
+
+
+def scan_deepx_devices():
+    """Return list of DeepX BDFs (single-device per host typical)."""
+    return scan_sysfs_deepx()
+
+
+_DXRT_CLI_CACHED = False
+_DXRT_CLI_PATH = None
+
+
+def _find_dxrt_cli():
+    """Locate the dxrt-cli binary (DeepX runtime telemetry CLI).
+
+    Cached after first call. Checks $PATH first, then falls back to
+    /usr/local/bin/dxrt-cli (the canonical install location). Returns
+    None if neither resolves.
+    """
+    global _DXRT_CLI_CACHED, _DXRT_CLI_PATH
+    if _DXRT_CLI_CACHED:
+        return _DXRT_CLI_PATH
+    _DXRT_CLI_CACHED = True
+    import shutil
+    path = shutil.which("dxrt-cli")
+    if path:
+        _DXRT_CLI_PATH = path
+        return path
+    cand = "/usr/local/bin/dxrt-cli"
+    if os.path.exists(cand) and os.access(cand, os.X_OK):
+        _DXRT_CLI_PATH = cand
+    return _DXRT_CLI_PATH
 
 
 # ElmorLabs PMD2 — USB CDC measurement device. STM32 VID:PID,
@@ -884,6 +933,192 @@ class AxeleraProbe:
             except Exception:
                 pass
         self._collector_enabled = False
+        self.device = None
+
+
+class DeepXProbe:
+    """Owns a single DeepX M1 NPU and polls per-NPU temperatures.
+
+    Telemetry is only available through the `dxrt-cli` binary (DXRT
+    3.2.0); the `dx_engine` Python package is for inference, not
+    monitoring. We shell out to `dxrt-cli -s` and parse stdout.
+
+    The M1 board has 3 NPU cores at fixed 1000 MHz / 750 mV. The
+    firmware reports per-NPU voltage, clock, and temperature, but
+    NOT power — so the POW history stays empty by design (same
+    pattern as AxeleraProbe on Metis M.2). Voltage and clock are
+    constants on this device, so we only graph temperature.
+    """
+
+    HISTORY_MAX = 720  # default; overridable via __init__
+    NPU_COUNT = 3      # M1 has 3 NPU cores (NPU 0/1/2)
+
+    # Match: " NPU 0: voltage 750 mV, clock 1000 MHz, temperature 29'C"
+    # The trailing apostrophe-then-C is dxrt-cli's degree substitute.
+    _NPU_LINE_PAT = re.compile(
+        r"^\s*NPU\s+(\d+)\s*:.*?temperature\s+([\d.]+)\s*'?\s*C",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, bdf, verbose=False, history_max=None):
+        self.bdf = bdf
+        self.pcie = pcie_info(bdf) or {}
+        self.identity = {"board_name": "DeepX M1"}
+        self.device = None
+        self.error = None
+        self._verbose = verbose
+        self._dxrt_cli = _find_dxrt_cli()
+        self.history_max = history_max or self.HISTORY_MAX
+
+        # Per-NPU temperature deques (T0..T(N-1)). Power is unsupported
+        # on M1; we keep an empty deque so the POW slot lines up with
+        # other probes' panels.
+        self.history_t = [deque(maxlen=self.history_max)
+                          for _ in range(self.NPU_COUNT)]
+        self.history_power = deque(maxlen=self.history_max)
+
+        # POW first to align visually with Hailo's POW slot (always
+        # None on M1), then T0..T(N-1) in distinct colors.
+        _T_COLORS = (CP_TRACE_TEMP,    # T0  yellow
+                     CP_OK,            # T1  green
+                     CP_TRACE_TOTAL)   # T2  magenta
+        self.metrics = [
+            Metric("POW", self.history_power, "W", CP_TRACE_POWER),
+        ] + [
+            Metric(f"T{i}", self.history_t[i], "°C", _T_COLORS[i])
+            for i in range(self.NPU_COUNT)
+        ]
+
+        self._open()
+
+    def _log(self, msg):
+        """Print a probe-scoped diagnostic to stderr when --verbose."""
+        if self._verbose:
+            print(f"[DeepXProbe {self.bdf}] {msg}", file=sys.stderr)
+
+    def _open(self):
+        if not self._dxrt_cli:
+            self.error = "dxrt-cli not found in $PATH or /usr/local/bin"
+            self._log(self.error)
+            return
+        # Probe with -i once at startup to grab firmware/driver versions
+        # and confirm the device responds.
+        try:
+            res = subprocess.run([self._dxrt_cli, "-i"],
+                                 capture_output=True, timeout=5)
+        except Exception as e:
+            self.error = f"dxrt-cli -i raised: {str(e).strip()[:60]}"
+            self._log(self.error)
+            return
+        if res.returncode != 0:
+            err = res.stderr.decode("utf-8", errors="replace").strip()
+            self.error = (f"dxrt-cli -i failed (rc={res.returncode}): "
+                          f"{err[:60]}")
+            self._log(self.error)
+            return
+        text = res.stdout.decode("utf-8", errors="replace")
+        # Pull a few labelled fields out of the banner.
+        fields = {}
+        for line in text.splitlines():
+            line = line.strip()
+            for key, regex in (("fw_version",
+                                r"\*\s*FW version\s*:\s*(\S+)"),
+                               ("rt_driver",
+                                r"\*\s*RT Driver version\s*:\s*(\S+)"),
+                               ("pcie_driver",
+                                r"\*\s*PCIe Driver version\s*:\s*(\S+)"),
+                               ("memory",
+                                r"\*\s*Memory\s*:\s*(.+)$"),
+                               ("board",
+                                r"\*\s*Board\s*:\s*(.+)$")):
+                m = re.match(regex, line)
+                if m:
+                    fields[key] = m.group(1).strip()
+        desc_bits = []
+        if fields.get("fw_version"):
+            desc_bits.append(f"FW {fields['fw_version']}")
+        if fields.get("memory"):
+            desc_bits.append(fields["memory"])
+        self.identity = {
+            "board_name": "DeepX M1",
+            "arch": "M.2",
+            "product_name": "DeepX DX_M1",
+            "description": ", ".join(desc_bits),
+            "serial": None,
+            "part_number": None,
+        }
+        self.device = True  # truthy → not 'ERROR' in TUI
+        self._log(f"opened (fw={fields.get('fw_version')}, "
+                  f"rt={fields.get('rt_driver')}, "
+                  f"pcie={fields.get('pcie_driver')})")
+
+    def poll(self):
+        temps = self._read_npu_temps() if self.device else None
+        for i in range(self.NPU_COUNT):
+            v = float(temps[i]) if (temps and i < len(temps)
+                                    and temps[i] is not None) else None
+            self.history_t[i].append(v)
+        self.history_power.append(None)  # power not exposed on M1
+        return temps, None
+
+    _status_fail_count = 0
+    _status_fail_logged = False
+
+    def _read_npu_temps(self):
+        """Run `dxrt-cli -s` and parse per-NPU temperature lines.
+
+        Returns a list of length NPU_COUNT, indexed by NPU id; entries
+        are float °C or None where the parse missed. Returns None if
+        the CLI call fails entirely.
+        """
+        try:
+            res = subprocess.run([self._dxrt_cli, "-s"],
+                                 capture_output=True, timeout=5)
+        except Exception as e:
+            self._status_fail_count += 1
+            if (self._status_fail_count == 5
+                    and not self._status_fail_logged):
+                self._status_fail_logged = True
+                self._log(f"dxrt-cli -s raised: {e}")
+            return None
+        if res.returncode != 0:
+            self._status_fail_count += 1
+            if (self._status_fail_count == 5
+                    and not self._status_fail_logged):
+                self._status_fail_logged = True
+                err = res.stderr.decode("utf-8", errors="replace").strip()
+                self._log(f"dxrt-cli -s failed (rc={res.returncode}): "
+                          f"{err[:200]}")
+            return None
+        text = res.stdout.decode("utf-8", errors="replace")
+        by_idx = {}
+        for line in text.splitlines():
+            m = self._NPU_LINE_PAT.match(line)
+            if m:
+                by_idx[int(m.group(1))] = float(m.group(2))
+        if not by_idx:
+            self._status_fail_count += 1
+            if (self._status_fail_count == 5
+                    and not self._status_fail_logged):
+                self._status_fail_logged = True
+                preview = text.strip().splitlines()[-5:] or ["<empty>"]
+                self._log("dxrt-cli -s had no NPU lines after 5 polls. "
+                          "Last output:")
+                for line in preview:
+                    self._log(f"    {line}")
+            return None
+        # Reset on success
+        self._status_fail_count = 0
+        self._status_fail_logged = False
+        return [by_idx.get(i) for i in range(self.NPU_COUNT)]
+
+    def reset_history(self):
+        for d in self.history_t:
+            d.clear()
+        self.history_power.clear()
+
+    def close(self):
+        # dxrt-cli is fire-and-forget — nothing to release.
         self.device = None
 
 
@@ -1938,6 +2173,8 @@ class TUI:
             "       (256 samples @ 1.1ms via Device.control)",
             "    Metis:  per-core temp via triton_trace --peek",
             "       (power not exposed on Metis M.2)",
+            "    DeepX:  per-NPU temp via dxrt-cli -s",
+            "       (power not exposed on M1)",
             "    PMD2:   PCIE1/2/3 + TOTAL rail power (USB CDC)",
             "    Adafruit: 1–4× INA228 power monitors over Adafruit",
             "       FT232H USB→I2C bridge (one POW trace per",
@@ -1995,10 +2232,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--device", action="append", default=None, metavar="ID",
         help=("Limit monitoring to this device ID (PCI BDF for Hailo/"
-              "Axelera, e.g. 0000:c6:00.0; serial port path for PMD2, "
-              "e.g. /dev/ttyACM0). Repeat for multiple. Default: all."))
+              "Axelera/DeepX, e.g. 0000:c6:00.0; serial port path for "
+              "PMD2, e.g. /dev/ttyACM0). Repeat for multiple. "
+              "Default: all."))
     def _probe_list(s):
-        valid = {"hailo", "axelera", "elmorlabs", "adafruit"}
+        valid = {"hailo", "axelera", "deepx", "elmorlabs", "adafruit"}
         items = [tok.strip().lower() for tok in s.split(",") if tok.strip()]
         if not items:
             raise argparse.ArgumentTypeError(
@@ -2032,7 +2270,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--probe", type=_probe_list, default=None, metavar="LIST",
         help=("Restrict discovery to a comma-separated list of probe "
-              "types — any of: hailo, axelera, elmorlabs (PMD2), "
+              "types — any of: hailo, axelera, deepx, elmorlabs (PMD2), "
               "adafruit (Adafruit INA228 sensors via FT232H USB→I2C "
               "bridge). The list ORDER also controls the on-screen "
               "panel order: e.g. --probe adafruit,hailo puts the "
@@ -2197,22 +2435,26 @@ def main(argv=None):
     # and the chip's self-report below it. Without --probe we use
     # DEFAULT_PROBE_ORDER, which leads with `adafruit` so the
     # ground-truth power measurement reads at the top of the screen.
-    DEFAULT_PROBE_ORDER = ["adafruit", "hailo", "axelera", "elmorlabs"]
+    DEFAULT_PROBE_ORDER = ["adafruit", "hailo", "axelera", "deepx",
+                           "elmorlabs"]
     order = list(args.probe) if args.probe else DEFAULT_PROBE_ORDER
     enabled = set(order)
 
     hailo_bdfs = scan_hailo_devices() if "hailo" in enabled else []
     axelera_pairs = scan_axelera_devices() if "axelera" in enabled else []
+    deepx_bdfs = scan_deepx_devices() if "deepx" in enabled else []
     pmd2_ports = scan_pmd2_devices() if "elmorlabs" in enabled else []
     adafruit_ids = scan_adafruit_devices() if "adafruit" in enabled else []
     if args.device:
         wanted = set(args.device)
         hailo_bdfs = [b for b in hailo_bdfs if b in wanted]
         axelera_pairs = [(b, s) for (b, s) in axelera_pairs if b in wanted]
+        deepx_bdfs = [b for b in deepx_bdfs if b in wanted]
         pmd2_ports = [p for p in pmd2_ports if p in wanted]
         adafruit_ids = [i for i in adafruit_ids if i in wanted]
         all_found = (set(hailo_bdfs)
                      | {b for b, _ in axelera_pairs}
+                     | set(deepx_bdfs)
                      | set(pmd2_ports)
                      | set(adafruit_ids))
         missing = wanted - all_found
@@ -2220,8 +2462,9 @@ def main(argv=None):
             print(f"Warning: requested devices not found: {sorted(missing)}",
                   file=sys.stderr)
 
-    if not (hailo_bdfs or axelera_pairs or pmd2_ports or adafruit_ids):
-        print("No Hailo, Axelera, PMD2, or Adafruit devices detected.",
+    if not (hailo_bdfs or axelera_pairs or deepx_bdfs or pmd2_ports
+            or adafruit_ids):
+        print("No Hailo, Axelera, DeepX, PMD2, or Adafruit devices detected.",
               file=sys.stderr)
         return 1
 
@@ -2234,6 +2477,9 @@ def main(argv=None):
         "axelera": lambda: [AxeleraProbe(b, s, verbose=args.verbose,
                                          history_max=history_max)
                             for (b, s) in axelera_pairs],
+        "deepx": lambda: [DeepXProbe(b, verbose=args.verbose,
+                                     history_max=history_max)
+                          for b in deepx_bdfs],
         "elmorlabs": lambda: [PMD2Probe(p, verbose=args.verbose,
                                         history_max=history_max)
                               for p in pmd2_ports],
