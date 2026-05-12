@@ -550,11 +550,25 @@ def scan_adafruit_devices():
 # ---------------------------------------------------------------------------
 
 class HailoProbe:
-    """Owns a single Hailo Device handle and polls temp/power at ~1Hz."""
+    """Owns a single Hailo Device handle and polls temp/power at ~1Hz.
+
+    Two device-acquisition modes:
+      1. Standalone (sdk_device=None): opens its own Device(bdf). This
+         is the default for the mb-powermon TUI.
+      2. Borrow (sdk_device=<Device>): uses a caller-provided handle.
+         Intended for embedded usage where another component
+         (e.g. an HailoInference VDevice) already owns the Device for
+         inference and wants to read telemetry through the same
+         handle to avoid contending for the firmware-side
+         power-measurement buffer. The probe still manages its own
+         start_power_measurement / stop_power_measurement on the
+         borrowed handle; it just doesn't release the handle on
+         close().
+    """
 
     HISTORY_MAX = 720  # ~12 min at 1Hz (default; overridable via __init__)
 
-    def __init__(self, bdf, history_max=None):
+    def __init__(self, bdf, sdk_device=None, history_max=None):
         self.bdf = bdf
         self.pcie = pcie_info(bdf) or {}
         self.identity = {}
@@ -562,12 +576,18 @@ class HailoProbe:
         self.power_started = False
         self.error = None
         self.history_max = history_max or self.HISTORY_MAX
+        # Track whether we opened the Device ourselves vs borrowed it
+        # from the caller. In borrow mode we skip Device(bdf) entirely
+        # and don't try to release the handle on close().
+        self._borrowed_device = False
 
         # When another HailoRT client (e.g. `hailortcli benchmark`)
         # calls start_power_measurement() on the same firmware buffer,
         # our averaging session gets clobbered — subsequent reads
         # return 0 or raise. Count consecutive "bad" polls and try to
-        # re-`start_power_measurement()` to recover.
+        # re-`start_power_measurement()` to recover. Not applicable in
+        # borrow mode (the caller controls the handle, no external
+        # client can race for it).
         self._power_fail_count = 0
         self._power_restart_threshold = 3  # ~3s at 1Hz
 
@@ -587,16 +607,26 @@ class HailoProbe:
             Metric("TS1", self.history_ts1,   "°C", CP_TRACE_TOTAL),
         ]
 
-        self._open()
+        self._open(sdk_device)
 
-    def _open(self):
+    def _open(self, sdk_device=None):
+        if sdk_device is None:
+            try:
+                from hailo_platform import Device
+            except ImportError as e:
+                self.error = f"hailo_platform not installed: {e}"
+                return
+            try:
+                self.device = Device(self.bdf)
+            except Exception as e:
+                msg = str(e).strip() or type(e).__name__
+                self.error = f"{msg[:60]}"
+                self.device = None
+                return
+        else:
+            self.device = sdk_device
+            self._borrowed_device = True
         try:
-            from hailo_platform import Device
-        except ImportError as e:
-            self.error = f"hailo_platform not installed: {e}"
-            return
-        try:
-            self.device = Device(self.bdf)
             info = self.device.control.identify()
             self.identity = {
                 "board_name": _clean(getattr(info, "board_name", None)),
