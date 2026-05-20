@@ -28,6 +28,14 @@ Data sources
                 from the DXRT runtime CLI (the dx_engine Python SDK
                 doesn't expose telemetry). 3 NPU cores → T0/T1/T2.
                 Power is not exposed on M1 so its trace stays empty.
+- MemryX MX3:   per-MPU temperatures from Linux hwmon (the
+                memx_pcie_ai_chip driver registers
+                /sys/class/hwmon/hwmonN with name='memx0' and
+                temp1..temp16 inputs in millidegrees C). On the
+                4-chip MX3-2280-M-4 SKU, temp1..temp4 populate one
+                per MPU; on a 2-chip SKU only temp1..temp2. Power
+                is not exposed via hwmon (use INA228 for ground-
+                truth power), so the POW trace stays empty.
 - ElmorLabs PMD2: USB CDC (VID:PID 0483:5740) via pyserial.
                 Reads total power and individual rails
                 (ATX12V, ATX5V, ATX5VSB, ATX3.3V, EPS, HPWR, PCIE2/3).
@@ -156,7 +164,14 @@ AXELERA_PCI_VENDOR = "0x1f9d"
 # PCI registry at firmware 2.5.0 / DXRT 3.2.0; matched by raw id rather
 # than by the "DEEPX" string in lspci output.
 DEEPX_PCI_VENDOR = "0x1ff4"
+# MemryX MX3 — the memx_pcie_ai_chip driver registers a hwmon node
+# named "memx0". We scan via hwmon name (canonical telemetry path)
+# rather than PCI vendor ID, because (a) the vendor ID isn't yet in
+# the public PCI registry and (b) hwmon presence implies the driver
+# is loaded, which is what actually matters for telemetry.
+MEMRYX_HWMON_NAME = "memx0"
 SYSFS_PCI = "/sys/bus/pci/devices"
+SYSFS_HWMON = "/sys/class/hwmon"
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +465,45 @@ def scan_sysfs_deepx():
 def scan_deepx_devices():
     """Return list of DeepX BDFs (single-device per host typical)."""
     return scan_sysfs_deepx()
+
+
+def scan_sysfs_memryx():
+    """Return sorted list of (hwmon_path, bdf) pairs for MemryX devices.
+
+    Scans /sys/class/hwmon/hwmon* for entries whose `name` matches
+    MEMRYX_HWMON_NAME ("memx0"). For each match, resolves the BDF
+    via the `device` symlink. This dual return lets the probe skip a
+    second hwmon search at __init__ time — it already has the path.
+
+    Driver presence implies the device is enumerated AND usable
+    (PCI vendor match alone would also report devices whose driver
+    failed to load).
+    """
+    found = []
+    for d in sorted(glob.glob(os.path.join(SYSFS_HWMON, "hwmon*"))):
+        try:
+            with open(os.path.join(d, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if name != MEMRYX_HWMON_NAME:
+            continue
+        dev_link = os.path.join(d, "device")
+        if not os.path.islink(dev_link):
+            continue
+        try:
+            target = os.readlink(dev_link)
+        except OSError:
+            continue
+        bdf = os.path.basename(target)
+        found.append((d, bdf))
+    return sorted(found, key=lambda x: x[1])
+
+
+def scan_memryx_devices():
+    """Return list of MemryX BDFs (drops the hwmon path; MemryXProbe
+    rediscovers it from the BDF at __init__ time)."""
+    return [bdf for (_, bdf) in scan_sysfs_memryx()]
 
 
 _DXRT_CLI_CACHED = False
@@ -1149,6 +1203,176 @@ class DeepXProbe:
 
     def close(self):
         # dxrt-cli is fire-and-forget — nothing to release.
+        self.device = None
+
+
+class MemryXProbe:
+    """Owns a single MemryX MX3 NPU and polls per-MPU temperatures.
+
+    Telemetry path: the `memx_pcie_ai_chip` kernel driver (loaded
+    from the `memx_cascade_plus_pcie` DKMS module) registers a
+    standard Linux hwmon node at /sys/class/hwmon/hwmonN/ with
+    name="memx0". The driver exposes temp1_input..temp16_input;
+    only the slots backing real MPU sensors return values. On the
+    4-chip MX3-2280-M-4 SKU, temp1..temp4 populate (one per MPU,
+    matching the MPU 0 → MPU 3 dataflow pipeline); on the 2-chip
+    SKU only temp1..temp2 populate. We probe at __init__ to
+    autodetect how many MPU sensors are live.
+
+    Power is NOT exposed via hwmon (only temperatures). For ground-
+    truth power, use the project's INA228 setup on the M.2 power
+    rail — same pattern Axelera and DeepX use (neither of which
+    expose power via sysfs/SDK). The POW history stays empty here
+    to keep the panel layout aligned with the other probes.
+
+    Pure sysfs reads — no SDK or daemon dependency, no root needed.
+    """
+
+    HISTORY_MAX = 720      # default; overridable via __init__
+    MAX_MPUS = 16          # driver reserves temp1..temp16
+
+    def __init__(self, bdf, verbose=False, history_max=None,
+                 hwmon_path=None):
+        self.bdf = bdf
+        self.pcie = pcie_info(bdf) or {}
+        self.identity = {"board_name": "MemryX MX3"}
+        self.device = None
+        self.error = None
+        self._verbose = verbose
+        self.history_max = history_max or self.HISTORY_MAX
+        self.hwmon_path = hwmon_path   # optional explicit override
+        self._populated_idxs = []
+
+        self._open()
+
+        # Build the metrics list AFTER _open() populates
+        # self._populated_idxs (typically 4 on M-4 SKU, 2 on
+        # M-2 SKU, 0 on probe failure). Power slot first to
+        # align visually with Hailo's POW slot (always None on
+        # MX3 — keeps panel layout consistent).
+        #
+        # Color order mirrors AxeleraProbe's choice for the first
+        # 4 sensors (TOTAL/TEMP/OK/POWER): MemryX has POW empty
+        # so reusing CP_TRACE_POWER for the 4th MPU is safe.
+        _T_COLORS = (CP_TRACE_TOTAL,   # T0 magenta — pipeline input
+                     CP_TRACE_TEMP,    # T1 yellow
+                     CP_OK,            # T2 green
+                     CP_TRACE_POWER,   # T3 cyan (POW empty on MX3)
+                     CP_CRIT)          # T4+ red, if future denser SKU
+        self.history_power = deque(maxlen=self.history_max)
+        self.history_t = [deque(maxlen=self.history_max)
+                          for _ in self._populated_idxs]
+        self.metrics = [
+            Metric("POW", self.history_power, "W", CP_TRACE_POWER),
+        ] + [
+            Metric(f"T{i}",
+                   self.history_t[i],
+                   "°C",
+                   _T_COLORS[i % len(_T_COLORS)])
+            for i in range(len(self._populated_idxs))
+        ]
+
+    def _log(self, msg):
+        """Print a probe-scoped diagnostic to stderr when --verbose."""
+        if self._verbose:
+            print(f"[MemryXProbe {self.bdf}] {msg}", file=sys.stderr)
+
+    def _find_hwmon_for_bdf(self):
+        """Scan /sys/class/hwmon for an entry matching self.bdf.
+
+        Returns the hwmon directory path, or None if not found.
+        """
+        for d in sorted(glob.glob(os.path.join(SYSFS_HWMON, "hwmon*"))):
+            try:
+                with open(os.path.join(d, "name")) as f:
+                    if f.read().strip() != MEMRYX_HWMON_NAME:
+                        continue
+            except OSError:
+                continue
+            dev_link = os.path.join(d, "device")
+            if not os.path.islink(dev_link):
+                continue
+            try:
+                target = os.readlink(dev_link)
+            except OSError:
+                continue
+            if os.path.basename(target) == self.bdf:
+                return d
+        return None
+
+    def _open(self):
+        # Find the hwmon node for this BDF (unless caller pre-supplied).
+        if self.hwmon_path is None:
+            self.hwmon_path = self._find_hwmon_for_bdf()
+        if self.hwmon_path is None:
+            self.error = (f"hwmon name='{MEMRYX_HWMON_NAME}' not found "
+                          f"for BDF {self.bdf} — is memx_pcie_ai_chip "
+                          f"loaded?")
+            self._log(self.error)
+            return
+
+        # Probe which temp slots are populated. The driver reserves
+        # temp1..temp16 but only the populated slots return values.
+        for i in range(1, self.MAX_MPUS + 1):
+            fn = os.path.join(self.hwmon_path, f"temp{i}_input")
+            try:
+                with open(fn) as f:
+                    raw = f.read().strip()
+                if raw:
+                    self._populated_idxs.append(i)
+            except OSError:
+                continue
+        if not self._populated_idxs:
+            self.error = "no populated temp sensors in hwmon"
+            self._log(self.error)
+            return
+
+        n = len(self._populated_idxs)
+        # arch is intentionally period-free — the TUI/snapshot
+        # formatter splits on '.' to unwrap enum qualnames like
+        # 'BoardType.METIS', which would eat "M.2" too. Use "M2"
+        # instead. Chip-count info lives in product_name.
+        self.identity = {
+            "board_name": "MemryX MX3",
+            "arch": f"M2 ({n}-chip)",
+            "product_name": f"MemryX MX3-2280-M-{n}",
+            "description": (f"hwmon={os.path.basename(self.hwmon_path)}, "
+                            f"temp1..temp{self._populated_idxs[-1]} "
+                            f"populated"),
+            "serial": None,
+            "part_number": None,
+        }
+        self.device = True   # truthy → not 'ERROR' in TUI
+        self._log(f"opened: hwmon={self.hwmon_path}, "
+                  f"populated_temps={self._populated_idxs}")
+
+    def poll(self):
+        if not self.device:
+            for d in self.history_t:
+                d.append(None)
+            self.history_power.append(None)
+            return None, None
+        temps = []
+        for idx, deq in zip(self._populated_idxs, self.history_t):
+            fn = os.path.join(self.hwmon_path, f"temp{idx}_input")
+            try:
+                with open(fn) as f:
+                    raw = f.read().strip()
+                v = float(raw) / 1000.0 if raw else None
+            except (OSError, ValueError):
+                v = None
+            temps.append(v)
+            deq.append(v)
+        self.history_power.append(None)   # MX3 doesn't expose power via hwmon
+        return temps, None
+
+    def reset_history(self):
+        for d in self.history_t:
+            d.clear()
+        self.history_power.clear()
+
+    def close(self):
+        # Pure sysfs reads — nothing to release.
         self.device = None
 
 
@@ -2205,6 +2429,8 @@ class TUI:
             "       (power not exposed on Metis M.2)",
             "    DeepX:  per-NPU temp via dxrt-cli -s",
             "       (power not exposed on M1)",
+            "    MemryX: per-MPU temp via Linux hwmon (memx0)",
+            "       (power not exposed via hwmon — use INA228)",
             "    PMD2:   PCIE1/2/3 + TOTAL rail power (USB CDC)",
             "    Adafruit: 1–4× INA228 power monitors over Adafruit",
             "       FT232H USB→I2C bridge (one POW trace per",
@@ -2262,11 +2488,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--device", action="append", default=None, metavar="ID",
         help=("Limit monitoring to this device ID (PCI BDF for Hailo/"
-              "Axelera/DeepX, e.g. 0000:c6:00.0; serial port path for "
-              "PMD2, e.g. /dev/ttyACM0). Repeat for multiple. "
+              "Axelera/DeepX/MemryX, e.g. 0000:c6:00.0; serial port "
+              "path for PMD2, e.g. /dev/ttyACM0). Repeat for multiple. "
               "Default: all."))
     def _probe_list(s):
-        valid = {"hailo", "axelera", "deepx", "elmorlabs", "adafruit"}
+        valid = {"hailo", "axelera", "deepx", "memryx", "elmorlabs",
+                 "adafruit"}
         items = [tok.strip().lower() for tok in s.split(",") if tok.strip()]
         if not items:
             raise argparse.ArgumentTypeError(
@@ -2300,9 +2527,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--probe", type=_probe_list, default=None, metavar="LIST",
         help=("Restrict discovery to a comma-separated list of probe "
-              "types — any of: hailo, axelera, deepx, elmorlabs (PMD2), "
-              "adafruit (Adafruit INA228 sensors via FT232H USB→I2C "
-              "bridge). The list ORDER also controls the on-screen "
+              "types — any of: hailo, axelera, deepx, memryx, elmorlabs "
+              "(PMD2), adafruit (Adafruit INA228 sensors via FT232H "
+              "USB→I2C bridge). The list ORDER also controls the on-screen "
               "panel order: e.g. --probe adafruit,hailo puts the "
               "INA228 ground-truth panel above the Hailo chip's "
               "self-report. Default: all probe types scanned, with "
@@ -2466,13 +2693,14 @@ def main(argv=None):
     # DEFAULT_PROBE_ORDER, which leads with `adafruit` so the
     # ground-truth power measurement reads at the top of the screen.
     DEFAULT_PROBE_ORDER = ["adafruit", "hailo", "axelera", "deepx",
-                           "elmorlabs"]
+                           "memryx", "elmorlabs"]
     order = list(args.probe) if args.probe else DEFAULT_PROBE_ORDER
     enabled = set(order)
 
     hailo_bdfs = scan_hailo_devices() if "hailo" in enabled else []
     axelera_pairs = scan_axelera_devices() if "axelera" in enabled else []
     deepx_bdfs = scan_deepx_devices() if "deepx" in enabled else []
+    memryx_bdfs = scan_memryx_devices() if "memryx" in enabled else []
     pmd2_ports = scan_pmd2_devices() if "elmorlabs" in enabled else []
     adafruit_ids = scan_adafruit_devices() if "adafruit" in enabled else []
     if args.device:
@@ -2480,11 +2708,13 @@ def main(argv=None):
         hailo_bdfs = [b for b in hailo_bdfs if b in wanted]
         axelera_pairs = [(b, s) for (b, s) in axelera_pairs if b in wanted]
         deepx_bdfs = [b for b in deepx_bdfs if b in wanted]
+        memryx_bdfs = [b for b in memryx_bdfs if b in wanted]
         pmd2_ports = [p for p in pmd2_ports if p in wanted]
         adafruit_ids = [i for i in adafruit_ids if i in wanted]
         all_found = (set(hailo_bdfs)
                      | {b for b, _ in axelera_pairs}
                      | set(deepx_bdfs)
+                     | set(memryx_bdfs)
                      | set(pmd2_ports)
                      | set(adafruit_ids))
         missing = wanted - all_found
@@ -2492,10 +2722,10 @@ def main(argv=None):
             print(f"Warning: requested devices not found: {sorted(missing)}",
                   file=sys.stderr)
 
-    if not (hailo_bdfs or axelera_pairs or deepx_bdfs or pmd2_ports
-            or adafruit_ids):
-        print("No Hailo, Axelera, DeepX, PMD2, or Adafruit devices detected.",
-              file=sys.stderr)
+    if not (hailo_bdfs or axelera_pairs or deepx_bdfs or memryx_bdfs
+            or pmd2_ports or adafruit_ids):
+        print("No Hailo, Axelera, DeepX, MemryX, PMD2, or Adafruit devices "
+              "detected.", file=sys.stderr)
         return 1
 
     eff_interval = max(0.001, args.interval)
@@ -2510,6 +2740,9 @@ def main(argv=None):
         "deepx": lambda: [DeepXProbe(b, verbose=args.verbose,
                                      history_max=history_max)
                           for b in deepx_bdfs],
+        "memryx": lambda: [MemryXProbe(b, verbose=args.verbose,
+                                       history_max=history_max)
+                           for b in memryx_bdfs],
         "elmorlabs": lambda: [PMD2Probe(p, verbose=args.verbose,
                                         history_max=history_max)
                               for p in pmd2_ports],
