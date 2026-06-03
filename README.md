@@ -10,7 +10,7 @@ Power and temperature measurement utility for edge AI NPUs.
 
 | Probe       | Hardware                                                                 | Metrics                                              |
 | ----------- | ------------------------------------------------------------------------ | ---------------------------------------------------- |
-| `hailo`     | Hailo-8 / 8L / 8R PCIe + M.2 modules                                     | `POW`, `TS0`, `TS1` (both on-die temperature sensors) |
+| `hailo`     | Hailo-8 / 8L / 8R PCIe + M.2 modules                                     | `POW`, `TS0`, `TS1` (both on-die temperature sensors); status row `CLOCK <MHz>  THERMAL [ OK \| L1 \| L2 \| L3 \| MAX ]  TEMP_PROT [ON \| OFF]  OCP [ OK \| ALERT]  OCP_PROT [ON \| OFF]` surfaces the firmware's throttling state from `_get_health_information()` (CLOCK = current effective NN clock; THERMAL = 5-tier throttle level; TEMP_PROT / OCP_PROT = feature-enable bits showing `ON` when protection is enabled and red `OFF` if explicitly disabled; OCP = overcurrent zone, binary per the SDK enum) |
 | `axelera`   | Axelera Metis M.2                                                        | `SYS` (module/system PVT) + `AI0`–`AI3` (per-AIPU-core PVT) via `triton_trace`; power not exposed on M.2 |
 | `deepx`     | DeepX M1 M.2 (PCI vendor `0x1ff4`)                                       | `T0`/`T1`/`T2` (per-NPU temperature) via `dxrt-cli -s`; power not exposed on M1 |
 | `memryx`    | MemryX MX3 M.2 (MX3-2280-M-4 = 4-chip, MX3-2280-M-2 = 2-chip)            | `T0`…`T(N-1)` (per-MPU temperature) via Linux hwmon (`name="memx0"`) + `POW` (chip power) via `memryx.mxa.get_power()` when the MX3 SDK is installed; status row `CLOCK <MHz>  THERMAL [ OK  OK  OK  OK ]  POWER [ OK ]` surfaces the current clock frequency, **per-chip** thermal-throttle latches (parsed from `/sys/memx0/temperature`), and the module-level power-alert (`[ OK ]` green, `[ALERT]` red) |
@@ -95,11 +95,37 @@ Each device renders as a panel with:
 
 1. **Identity line** — `Device N [BDF Board ARCH]  PCIe x4/x4 @ 8.0GT/s  ASPM L1`
 2. **Stats line** — product name, description, part number, serial (or `ERROR` + reason)
-3. **Status line** (probes that expose state flags) — `<LABEL> value  <FLAG> [ OK ]  ...` with the badge inside each bracket bold-green ` OK ` / bold-red `ALERT` / dim ` -- `. Consecutive `PREFIX_<digit>` flags collapse into one widget (e.g. `THERMAL_0..THERMAL_3` → `THERMAL [ OK  OK  OK  OK ]`), one inner badge per chip. Today only MemryX populates this row; other probes skip it (no row cost).
+3. **Status line** (probes that expose state flags) — `<LABEL> value  <FLAG> [ OK ]  ...`. Three built-in badge styles, picked per flag by the probe:
+   - **Binary OK/ALERT** (default) — bold-green ` OK ` for `0`, bold-red `ALERT` for non-zero, dim ` -- ` for no reading. Used for event indicators like Hailo `OCP` and MemryX `POWER`.
+   - **Multi-state ladder** — custom formatter the probe supplies. Hailo's `THERMAL` shows a 5-state ladder ` OK ` / ` L1 ` / ` L2 ` / ` L3 ` / ` MAX` (green / yellow / magenta / red / red+reverse) matching the firmware's 4 graduated throttle tiers plus the "not throttling" baseline.
+   - **ON/OFF feature-enable** (`_on_off_badge`) — bold-green `ON ` for `1`, bold-red `OFF` for `0`. Used for protection-enabled bits like Hailo's `TEMP_PROT` and `OCP_PROT`, where `OFF` is the dangerous state worth surfacing in red.
+   Consecutive `PREFIX_<digit>` flags collapse into one widget (e.g. MemryX's `THERMAL_0..THERMAL_3` → `THERMAL [ OK  OK  OK  OK ]`), one inner badge per chip. MemryX and Hailo populate this row; other probes skip it (no row cost).
 4. **Inline bars** — one per metric, color-coded
 5. **Time-series graph** — one trace per metric; y-axis caps from `--temp-max` / `--power-max` or per-metric overrides
 
-The `--csv` and `--once` outputs include the full per-rail PMD2 snapshot and per-sensor INA228 voltage/current, which the TUI omits to keep panels readable. State-flag values (e.g. MemryX `<bdf>_THERMAL_0..3` and `<bdf>_POWER`) become extra integer columns in the CSV.
+The `--csv` and `--once` outputs include the full per-rail PMD2 snapshot and per-sensor INA228 voltage/current, which the TUI omits to keep panels readable. State-flag values become extra integer columns in the CSV — MemryX adds `<bdf>_THERMAL_0..3` (per-chip throttle) and `<bdf>_POWER` (module power-alert); Hailo adds `<bdf>_THERMAL` (−1 / 0 / 1 / 2 / 3 — throttling level), `<bdf>_TEMP_PROT` and `<bdf>_OCP_PROT` (0 / 1 — protection-enabled bits, normally `1`), and `<bdf>_OCP` (0 / 1 — overcurrent zone). The CLOCK prefix is display-only — not logged to CSV since it's a deterministic function of `<bdf>_THERMAL` plus the firmware's static per-level table.
+
+`--once` field labels render uppercase (`BOARD`, `PRODUCT`, `PCIE`, `ASPM`, `POW`, `TS0`, `CLOCK`, `THERMAL`, `OCP_PROT`, `RAIL ATX12V`, …) — same across all probes so output is greppable. MemryX's SDK clock is rendered as `CLOCK = X MHz` to match Hailo, not `FREQ`.
+
+Example Hailo `--once` panel:
+
+```
+[0000:c5:00.0]
+    BOARD     = Hailo-8  ARCH=HAILO8
+    PRODUCT   = HAILO-8 AI ACC M.2 M KEY MODULE EXT TEMP
+    PART      = HM218B1C2FAE
+    SERIAL    = HLLWM2B225101659
+    PCIE      = x4/x4 @ 8.0 GT/s PCIe (max 8.0 GT/s PCIe)
+    ASPM      = L1
+    POW       = 1.95W
+    TS0       = 34.64°C
+    TS1       = 34.58°C
+    CLOCK     = 400MHz
+    THERMAL   = -1 (OK)
+    TEMP_PROT = 1 (ON)
+    OCP       = 0 (OK)
+    OCP_PROT  = 1 (ON)
+```
 
 ### Troubleshooting: INA228 reads exactly `0.0` W during heavy load
 

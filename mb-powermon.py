@@ -673,6 +673,35 @@ class HailoProbe:
             Metric("TS1", self.history_ts1,   "°C", CP_TRACE_TOTAL),
         ]
 
+        # Throttling state from device.control._get_health_information().
+        # Four flags + a CLOCK prefix (set as state_flags below after
+        # _open() confirms the call works on this firmware):
+        #   THERMAL   — current_temperature_throttling_level (5 states:
+        #               -1 / 0 / 1 / 2 / 3 → OK / L1 / L2 / L3 / MAX),
+        #               custom formatter maps each to a distinct color
+        #               (green → yellow → magenta → red → red+reverse).
+        #   TEMP_PROT — temperature_throttling_active (feature-enable
+        #               bit, NOT a "has-fired" latch; healthy idle
+        #               reads 1=ON). Uses _on_off_badge.
+        #   OCP       — current_overcurrent_zone (binary GREEN=0/RED=1
+        #               per OvercurrentAlertState enum; firmware-
+        #               internal 3-level + max structure isn't lifted
+        #               into Python). Default OK/ALERT formatter.
+        #   OCP_PROT  — overcurrent_throttling_active (feature-enable
+        #               bit, same semantics as TEMP_PROT). _on_off_badge.
+        # CLOCK prefix: derived per poll from THERMAL level + the
+        # firmware's requested clock & per-level throttle table
+        # (captured once at _probe_health_info()).
+        self._hist_thermal_throttle = deque(maxlen=self.history_max)
+        self._hist_temp_prot        = deque(maxlen=self.history_max)
+        self._hist_ocp_zone         = deque(maxlen=self.history_max)
+        self._hist_ocp_prot         = deque(maxlen=self.history_max)
+        self._requested_clock_mhz   = None
+        self._throttle_level_freq_mhz = {}
+        self._current_clock_mhz     = None
+        self._health_supported      = False  # set in _open() if probe succeeds
+        self.state_flags = []   # populated in _open()
+
         self._open(sdk_device)
 
     def _open(self, sdk_device=None):
@@ -715,10 +744,71 @@ class HailoProbe:
                 key_map.get(part[4], "")
                 if len(part) >= 5 and part.startswith("HM") else "")
             self._start_power()
+            self._probe_health_info()
         except Exception as e:
             msg = str(e).strip() or type(e).__name__
             self.error = f"{msg[:60]}"
             self.device = None
+
+    def _probe_health_info(self):
+        """One-shot capability check + state_flags wiring + clock-table
+        capture.
+
+        The throttling-state API is on `control._get_health_information`
+        (underscore-prefixed in HailoRT 2025-10's pyhailort; the
+        non-underscore alias was renamed). If the call succeeds we
+        wire four state_flags entries (THERMAL/TEMP_PROT/OCP/OCP_PROT)
+        and capture the firmware's `requested_*_clock_freq` + per-
+        level throttle table so `state_prefix` can render the current
+        effective clock as `CLOCK <freq>MHz` ahead of the badges.
+        """
+        if self.device is None:
+            return
+        ctrl = self.device.control
+        getter = getattr(ctrl, "_get_health_information", None) \
+                 or getattr(ctrl, "get_health_information", None)
+        if getter is None:
+            return
+        try:
+            h = getter()
+        except Exception:
+            return
+        self._health_supported = True
+        # Capture the clock context once — these don't change at runtime.
+        req = getattr(h, "requested_temperature_clock_freq", None) \
+              or getattr(h, "requested_overcurrent_clock_freq", None)
+        if req:
+            self._requested_clock_mhz = req / 1e6
+        # Map throttle level (`level_number`) → effective NN clock (MHz).
+        for lvl in (getattr(h, "temperature_throttling_levels", None) or []):
+            f = getattr(lvl, "throttling_nn_clock_freq", None)
+            n = getattr(lvl, "level_number", None)
+            if n is not None and f:
+                self._throttle_level_freq_mhz[int(n)] = f / 1e6
+        # Order: thermal first (its level drives CLOCK), then temp-
+        # protection-enable, then OCP zone + its protection-enable.
+        self.state_flags = [
+            ("THERMAL",   self._hist_thermal_throttle, _hailo_thermal_badge),
+            ("TEMP_PROT", self._hist_temp_prot,        _on_off_badge),
+            ("OCP",       self._hist_ocp_zone),
+            ("OCP_PROT",  self._hist_ocp_prot,         _on_off_badge),
+        ]
+
+    @property
+    def state_prefix(self):
+        """`(label, value_str)` rendered ahead of the state-flag badges
+        on the status row. For Hailo: current effective NN clock in
+        MHz — `requested_*_clock_freq` (typically 400 MHz) at level
+        -1, or the throttled per-level frequency when throttling is
+        active (350/300/250/200 MHz on this firmware).
+
+        Returns None if the health probe hasn't run successfully or
+        the clock context is missing — the TUI then omits the prefix
+        and the row starts with the first badge.
+        """
+        if self._current_clock_mhz is None:
+            return None
+        return ("CLOCK", f"{self._current_clock_mhz:.0f}MHz")
 
     def _start_power(self):
         """(Re)start firmware-side averaged power measurement.
@@ -759,6 +849,10 @@ class HailoProbe:
         ts0 = None
         ts1 = None
         power = None
+        thermal_lvl = None
+        temp_prot = None
+        ocp_zone = None
+        ocp_prot = None
         if self.device is not None:
             try:
                 t = self.device.control.get_chip_temperature()
@@ -776,9 +870,38 @@ class HailoProbe:
                             power = self._read_power()
                 else:
                     self._power_fail_count = 0
+            if self._health_supported:
+                try:
+                    getter = (getattr(self.device.control,
+                                      "_get_health_information", None)
+                              or self.device.control.get_health_information)
+                    h = getter()
+                    thermal_lvl = int(h.current_temperature_throttling_level)
+                    # OvercurrentAlertState is an IntEnum (GREEN=0, RED=1);
+                    # coerce to int so the deque holds a plain Python int
+                    # for CSV serialization.
+                    ocp_zone = int(h.current_overcurrent_zone)
+                    ocp_prot = 1 if h.overcurrent_throttling_active else 0
+                    temp_prot = 1 if h.temperature_throttling_active else 0
+                except Exception:
+                    pass
+        # Effective NN clock derived from the current throttle level:
+        # if not throttling (lvl == -1 or None), the chip runs at the
+        # firmware-requested baseline (typically 400 MHz on Hailo-8);
+        # if throttling, look up the per-level frequency captured at
+        # _probe_health_info().
+        if thermal_lvl is None or thermal_lvl < 0:
+            self._current_clock_mhz = self._requested_clock_mhz
+        else:
+            self._current_clock_mhz = self._throttle_level_freq_mhz.get(
+                thermal_lvl, self._requested_clock_mhz)
         self.history_ts0.append(ts0)
         self.history_ts1.append(ts1)
         self.history_power.append(power)
+        self._hist_thermal_throttle.append(thermal_lvl)
+        self._hist_temp_prot.append(temp_prot)
+        self._hist_ocp_zone.append(ocp_zone)
+        self._hist_ocp_prot.append(ocp_prot)
         return ts0, ts1, power
 
     def _read_power(self):
@@ -800,6 +923,10 @@ class HailoProbe:
         self.history_ts0.clear()
         self.history_ts1.clear()
         self.history_power.clear()
+        self._hist_thermal_throttle.clear()
+        self._hist_temp_prot.clear()
+        self._hist_ocp_zone.clear()
+        self._hist_ocp_prot.clear()
 
     def close(self):
         if self.power_started and self.device is not None:
@@ -2145,6 +2272,92 @@ def _clean(s):
     return s.rstrip()
 
 
+def _default_state_badge(val):
+    """Default state-flag formatter: binary OK / ALERT / -- mapping.
+
+    Returns `(text, color_pair_id, attrs)`. The renderer always layers
+    `A_BOLD` on top of returned attrs. Used when a `state_flags` entry
+    has no per-flag formatter (the 2-tuple short form).
+    """
+    if val is None:
+        return " -- ", CP_DIM, 0
+    if val == 0:
+        return " OK ", CP_OK, 0
+    return "ALERT", CP_CRIT, 0
+
+
+def _on_off_badge(val):
+    """ON / OFF formatter for feature-enable flags where `1 = ON = green`
+    and `0 = OFF = red`.
+
+    Used for Hailo's `overcurrent_throttling_active` and
+    `temperature_throttling_active`, both of which the SDK names
+    suggest are latches but empirically are feature-enable bits
+    (toggling `set_throttling_state(False)` flips both to 0). On a
+    healthy idle chip they read `1` (= ON, protection enabled); a
+    `0` reading (= OFF) means someone has explicitly disabled the
+    protection — which is the genuinely-dangerous state worth
+    surfacing in red.
+
+    Text widths: "ON " and "OFF" are both 3 chars so the bracketed
+    badges render at uniform width `[ON ]` / `[OFF]` for alignment.
+    """
+    if val is None:
+        return " -- ", CP_DIM, 0
+    if val != 0:
+        return "ON ", CP_OK, 0
+    return "OFF", CP_CRIT, 0
+
+
+def _hailo_thermal_badge(val):
+    """5-state THERMAL ladder for Hailo's `current_temperature_throttling_level`.
+
+    The firmware reports −1 when no throttling is active, then four
+    graduated tiers as the chip heats up:
+      −1 → ` OK ` (green)            — full clock (requested freq)
+       0 → ` L1 ` (yellow)           — first throttle at red_orange threshold
+       1 → ` L2 ` (magenta)          — escalating
+       2 → ` L3 ` (red)              — escalating
+       3 → ` MAX` (red + reverse)    — top tier; absolute red threshold sits above
+
+    Curses only has 8 base colors, so we substitute magenta for the
+    "orange" mid-tier — visually distinct from yellow (L1) below and
+    red (L3) above. MAX uses reverse video to stand apart from L3.
+    """
+    if val is None:
+        return " -- ", CP_DIM, 0
+    if val < 0:
+        return " OK ", CP_OK, 0
+    if val == 0:
+        return " L1 ", CP_WARN, 0
+    if val == 1:
+        return " L2 ", CP_TRACE_TOTAL, 0    # magenta
+    if val == 2:
+        return " L3 ", CP_CRIT, 0
+    # val >= 3 — top tier and beyond
+    return " MAX", CP_CRIT, curses.A_REVERSE
+
+
+def _format_state_badge(formatter, val):
+    """Dispatch to a per-flag formatter or the default. Always returns
+    a 3-tuple `(text, color, attrs)` — formatters that return a 2-tuple
+    are zero-padded for backward-compat."""
+    if formatter is None:
+        return _default_state_badge(val)
+    try:
+        result = formatter(val)
+    except Exception:
+        return _default_state_badge(val)
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            return result
+        if len(result) == 2:
+            text, color = result
+            return text, color, 0
+    # Misbehaving formatter — fall back rather than raising.
+    return _default_state_badge(val)
+
+
 def _safe_addstr(win, y, x, s, attr=0):
     """addstr that never raises on boundary-reached writes."""
     if y < 0 or x < 0:
@@ -2239,9 +2452,11 @@ class TUI:
                 # e.g. THERMAL, POWER for MemryX). Not part of
                 # `metrics` because they're state indicators, not
                 # graphed time-series.
-                for label, _hist in (getattr(p, "state_flags", None)
-                                     or []):
-                    cols.append(f"{p.bdf}_{label}")
+                # state_flags entries are (label, hist) or
+                # (label, hist, formatter) — we only need the first
+                # two elements for CSV purposes.
+                for entry in (getattr(p, "state_flags", None) or []):
+                    cols.append(f"{p.bdf}_{entry[0]}")
             try:
                 self._csv_file.write(",".join(cols) + "\n")
             except (OSError, ValueError):
@@ -2254,7 +2469,8 @@ class TUI:
             for m in (getattr(p, "metrics", None) or []):
                 v = m.history[-1] if m.history else None
                 row.append("" if v is None else f"{v:.6f}")
-            for _label, hist in (getattr(p, "state_flags", None) or []):
+            for entry in (getattr(p, "state_flags", None) or []):
+                hist = entry[1]
                 v = hist[-1] if hist else None
                 # Integer-valued enums; write without trailing zeros
                 row.append("" if v is None else f"{int(v)}")
@@ -2417,15 +2633,9 @@ class TUI:
         # form into one widget. Non-matching labels render alone.
         groups = self._group_state_flags(flags)
 
-        def badge(val):
-            if val is None:
-                return " -- ", CP_DIM
-            if val == 0:
-                return " OK ", CP_OK
-            return "ALERT", CP_CRIT
-
-        for label, hists in groups:
-            states = [badge(h[-1] if h else None) for h in hists]
+        for label, entries in groups:
+            states = [_format_state_badge(fmt, h[-1] if h else None)
+                      for h, fmt in entries]
             # Total width: "  LABEL [s0  s1 ... sN-1]"
             sep = "  " if x > 0 else ""
             head_len = len(sep) + len(label) + 1 + 1  # "<sep><label> ["
@@ -2437,11 +2647,11 @@ class TUI:
             _safe_addstr(stdscr, y, x, f"{sep}{label} ", accent)
             x += len(sep) + len(label) + 1
             _safe_addstr(stdscr, y, x, "[", dim); x += 1
-            for i, (text, color) in enumerate(states):
+            for i, (text, color, attrs) in enumerate(states):
                 if i > 0:
                     _safe_addstr(stdscr, y, x, "  ", dim); x += 2
                 _safe_addstr(stdscr, y, x, text,
-                             curses.color_pair(color) | curses.A_BOLD)
+                             curses.color_pair(color) | curses.A_BOLD | attrs)
                 x += len(text)
             _safe_addstr(stdscr, y, x, "]", dim); x += 1
 
@@ -2449,29 +2659,39 @@ class TUI:
 
     def _group_state_flags(self, flags):
         """Collapse consecutive `PREFIX_<digit>` labels into a single
-        widget. Returns a list of `(display_label, [hist, ...])` where
-        non-grouped labels yield a single-element history list."""
+        widget. Returns a list of `(display_label, [(hist, formatter), ...])`
+        — non-grouped labels yield a single-element list. Each
+        `state_flags` entry may be either `(label, hist)` (binary OK/
+        ALERT via the default formatter, `formatter=None` here) or
+        `(label, hist, formatter)` where formatter is
+        `value -> (text, color_pair_id, attrs)`."""
+        def _unpack(entry):
+            if len(entry) == 2:
+                return entry[0], entry[1], None
+            return entry[0], entry[1], entry[2]
+
         groups = []
         i = 0
         n = len(flags)
         while i < n:
-            label, hist = flags[i]
+            label, hist, fmt = _unpack(flags[i])
             m = self._GROUP_RE.match(label)
             if m:
                 prefix = m.group(1)
-                hists = [hist]
+                pairs = [(hist, fmt)]
                 j = i + 1
                 while j < n:
-                    m2 = self._GROUP_RE.match(flags[j][0])
+                    label2, hist2, fmt2 = _unpack(flags[j])
+                    m2 = self._GROUP_RE.match(label2)
                     if m2 and m2.group(1) == prefix:
-                        hists.append(flags[j][1])
+                        pairs.append((hist2, fmt2))
                         j += 1
                     else:
                         break
-                groups.append((prefix, hists))
+                groups.append((prefix, pairs))
                 i = j
             else:
-                groups.append((label, [hist]))
+                groups.append((label, [(hist, fmt)]))
                 i += 1
         return groups
 
@@ -3011,58 +3231,101 @@ def do_snapshot(probes):
         if ident:
             arch = ident.get("arch")
             arch_s = str(arch).split(".")[-1] if arch else "?"
-            print(f"    board     = {ident.get('board_name') or '?'}"
-                  f"  arch={arch_s}")
+            print(f"    BOARD     = {ident.get('board_name') or '?'}"
+                  f"  ARCH={arch_s}")
             if ident.get("product_name"):
-                print(f"    product   = {ident['product_name']}")
+                print(f"    PRODUCT   = {ident['product_name']}")
             if ident.get("description"):
-                print(f"    desc      = {ident['description']}")
+                print(f"    DESC      = {ident['description']}")
             if ident.get("part_number"):
-                print(f"    part      = {ident['part_number']}")
+                print(f"    PART      = {ident['part_number']}")
             if ident.get("serial"):
-                print(f"    serial    = {ident['serial']}")
+                print(f"    SERIAL    = {ident['serial']}")
         if pcie:
-            print(f"    pcie      = x{cur_w}/x{max_w} @ {cur_s} "
+            print(f"    PCIE      = x{cur_w}/x{max_w} @ {cur_s} "
                   f"(max {max_s})")
         aspm = pcie.get("aspm")
         aspm_err = pcie.get("aspm_error")
         if aspm:
-            print(f"    aspm      = {aspm}")
+            print(f"    ASPM      = {aspm}")
         elif aspm_err:
-            print(f"    aspm      = <{aspm_err}>")
+            print(f"    ASPM      = <{aspm_err}>")
         busy = "" if p.device is not None else "  [ERROR]"
         for m in (getattr(p, "metrics", None) or []):
             v = m.history[-1] if m.history else None
             v_s = (f"{v:.2f}{m.unit}" if v is not None else "n/a")
             tag = busy if (m is p.metrics[-1]) else ""
-            print(f"    {m.label.lower():<10}= {v_s}{tag}")
+            # Metric labels are stored uppercase ("POW", "TS0", ...) so
+            # we use them verbatim — no .lower() needed for CAPS output.
+            print(f"    {m.label:<10}= {v_s}{tag}")
         snap = getattr(p, "last_snapshot", None)
+        # MemryX has its own block below that prints `CLOCK = X MHz`,
+        # so suppress the generic state_prefix / state_flags renderers
+        # for it to avoid duplication.
+        memryx_block = bool(snap and "thermal_states" in snap)
+        # Generic state_prefix printer — surfaces the `(label, value)`
+        # the probe renders before its state-flag badges on the TUI
+        # status row. For Hailo: `CLOCK = 400MHz` (current effective
+        # NN clock, drops with the throttle level).
+        prefix = getattr(p, "state_prefix", None)
+        if callable(prefix):
+            try:
+                prefix = prefix()
+            except Exception:
+                prefix = None
+        if prefix and not memryx_block:
+            if isinstance(prefix, tuple) and len(prefix) == 2:
+                p_label, p_value = prefix
+            else:
+                p_label, p_value = "STATUS", str(prefix)
+            # state_prefix labels are stored uppercase ("CLOCK") — emit
+            # verbatim, force-upper for safety in case a probe slips a
+            # lowercase string in.
+            print(f"    {str(p_label).upper():<10}= {p_value}")
+        # Generic state_flags printer — runs for probes that DON'T have
+        # a custom last_snapshot rendering block below (e.g. Hailo:
+        # THERMAL / TEMP_PROT / OCP / OCP_PROT). Uses each flag's
+        # formatter to get the badge text so the --once output matches
+        # what the TUI shows. Skipped for MemryX (which has its own
+        # per-chip block via snap["thermal_states"]).
+        sflags = getattr(p, "state_flags", None) or []
+        if sflags and not memryx_block:
+            for entry in sflags:
+                label = entry[0]
+                hist = entry[1]
+                fmt = entry[2] if len(entry) >= 3 else None
+                v = hist[-1] if hist else None
+                text, _color, _attrs = _format_state_badge(fmt, v)
+                v_s = "n/a" if v is None else str(int(v))
+                # state_flags labels are stored uppercase — force-upper
+                # for safety.
+                print(f"    {label.upper():<10}= {v_s} ({text.strip()})")
         # MemryX schema: voltage + frequency + per-chip thermal
         # throttle states + module-level power-alert
         if snap and ("thermal_states" in snap or "power_alert" in snap):
             volt = snap.get("voltage_mv")
             freq = snap.get("frequency_mhz")
             if volt is not None:
-                print(f"    volt      = {volt} mV")
+                print(f"    VOLT      = {volt} mV")
             if freq is not None:
-                print(f"    freq      = {freq:.0f} MHz")
+                print(f"    CLOCK     = {freq:.0f} MHz")
             ts_list = snap.get("thermal_states")
             pa = snap.get("power_alert")
             if ts_list:
                 tags = ["OK" if v == 0 else "ALERT" for v in ts_list]
                 pretty = " ".join(f"chip{i}:{int(v)}({t})"
                                   for i, (v, t) in enumerate(zip(ts_list, tags)))
-                print(f"    thermal   = {pretty}")
+                print(f"    THERMAL   = {pretty}")
             if pa is not None:
                 state = "OK" if pa == 0 else "ALERT"
-                print(f"    pwr_alert = {int(pa)} ({state})")
+                print(f"    PWR_ALERT = {int(pa)} ({state})")
         if snap and "rails" in snap:
             for r in snap["rails"]:
-                print(f"    rail {r['name']:<6}= "
+                print(f"    RAIL {r['name']:<6}= "
                       f"{r['voltage_v']:5.2f}V  "
                       f"{r['current_a']:6.3f}A  "
                       f"{r['power_w']:6.2f}W")
-            print(f"    aggregate = EPS:{snap['eps_w']}W  "
+            print(f"    AGGREGATE = EPS:{snap['eps_w']}W  "
                   f"PCIE:{snap['pcie_w']}W  "
                   f"ATX24:{snap['atx24_w']:.1f}W  "
                   f"TOT:{snap['total_w']}W")
@@ -3078,7 +3341,7 @@ def do_snapshot(probes):
                 tag = f"P{addr_to_index.get(s['addr'], '?')} (0x{s['addr']:02X})"
                 print(f"    {tag:<14}= {v_s}  {i_s}  {p_s}")
         if p.error:
-            print(f"    error     = {p.error}")
+            print(f"    ERROR     = {p.error}")
         print()
 
 
@@ -3092,8 +3355,8 @@ def write_csv_snapshot(csv_file, probes):
     for p in probes:
         for m in (getattr(p, "metrics", None) or []):
             cols.append(f"{p.bdf}_{m.label}")
-        for label, _hist in (getattr(p, "state_flags", None) or []):
-            cols.append(f"{p.bdf}_{label}")
+        for entry in (getattr(p, "state_flags", None) or []):
+            cols.append(f"{p.bdf}_{entry[0]}")
     csv_file.write(",".join(cols) + "\n")
     ts = datetime.now().isoformat(timespec="milliseconds")
     row = [ts]
@@ -3101,7 +3364,8 @@ def write_csv_snapshot(csv_file, probes):
         for m in (getattr(p, "metrics", None) or []):
             v = m.history[-1] if m.history else None
             row.append("" if v is None else f"{v:.6f}")
-        for _label, hist in (getattr(p, "state_flags", None) or []):
+        for entry in (getattr(p, "state_flags", None) or []):
+            hist = entry[1]
             v = hist[-1] if hist else None
             row.append("" if v is None else f"{int(v)}")
     csv_file.write(",".join(row) + "\n")
