@@ -170,6 +170,18 @@ DEEPX_PCI_VENDOR = "0x1ff4"
 # the public PCI registry and (b) hwmon presence implies the driver
 # is loaded, which is what actually matters for telemetry.
 MEMRYX_HWMON_NAME = "memx0"
+# Per-board vendor sysfs node `/sys/memx<N>/temperature`. Format is
+# human-readable, one line per chip:
+#   CHIP(0) PVT3 Temperature: Temperature: 62 C (335 K) (ThermalThrottlingState: 0)
+# We parse the ThermalThrottlingState per chip — the SDK's
+# `mxa.get_thermal_state(device_id)` is module-level (no chip_id arg)
+# and effectively the OR of these, so this is the only source for
+# per-chip granularity. Always available when memx_pcie_ai_chip is
+# loaded; no SDK dependency.
+MEMRYX_SYSFS_FMT = "/sys/memx{}/temperature"
+MEMRYX_SYSFS_RE = re.compile(
+    r"^\s*CHIP\(\s*(\d+)\s*\).*?ThermalThrottlingState:\s*(\d+)",
+    re.MULTILINE)
 SYSFS_PCI = "/sys/bus/pci/devices"
 SYSFS_HWMON = "/sys/class/hwmon"
 
@@ -1207,32 +1219,43 @@ class DeepXProbe:
 
 
 class MemryXProbe:
-    """Owns a single MemryX MX3 NPU and polls per-MPU temperatures.
+    """Owns a single MemryX MX3 NPU and polls power + per-MPU temperatures.
 
-    Telemetry path: the `memx_pcie_ai_chip` kernel driver (loaded
-    from the `memx_cascade_plus_pcie` DKMS module) registers a
-    standard Linux hwmon node at /sys/class/hwmon/hwmonN/ with
-    name="memx0". The driver exposes temp1_input..temp16_input;
-    only the slots backing real MPU sensors return values. On the
-    4-chip MX3-2280-M-4 SKU, temp1..temp4 populate (one per MPU,
-    matching the MPU 0 → MPU 3 dataflow pipeline); on the 2-chip
-    SKU only temp1..temp2 populate. We probe at __init__ to
-    autodetect how many MPU sensors are live.
+    Telemetry comes from two sources (a hybrid pattern unique among
+    this project's probes):
 
-    Power is NOT exposed via hwmon (only temperatures). For ground-
-    truth power, use the project's INA228 setup on the M.2 power
-    rail — same pattern Axelera and DeepX use (neither of which
-    expose power via sysfs/SDK). The POW history stays empty here
-    to keep the panel layout aligned with the other probes.
+    - **memryx.mxa SDK module** (when installed): power (mW → W), clock
+      (MHz), voltage (mV), thermal state, power alert. Always-on
+      readings — no DFP, no active inference required. Source for the
+      POW + CLK metrics on the TUI panel and for the VOLT /
+      THERMAL_STATE / POWER_ALERT extras in `last_snapshot` / `--once`.
+      Capability is gated per-device via memryx.mxa.get_power()
+      raising — older modules / SDK revisions may not support it.
 
-    Pure sysfs reads — no SDK or daemon dependency, no root needed.
+    - **hwmon (kernel)**: per-MPU temperatures. The
+      `memx_pcie_ai_chip` driver registers a standard Linux hwmon
+      node at /sys/class/hwmon/hwmonN/ with name="memx0", exposing
+      temp1_input..temp16_input. On the 4-chip MX3-2280-M-4 SKU
+      temp1..temp4 populate (one per MPU, matching the MPU 0 → MPU 3
+      dataflow pipeline); on the 2-chip SKU only temp1..temp2 populate.
+      We probe at __init__ to autodetect how many MPU sensors are live.
+
+    The hwmon per-MPU values are richer than the SDK's single scalar
+    `get_temperature()` (which reports a board-level average — about
+    10 °C below the actual per-MPU die readings), so we always prefer
+    hwmon for the T0..T<n> metrics even when the SDK is available.
+
+    When the SDK isn't installed (or `can_get_power_consumption` is
+    False on this device), the probe degrades to "hwmon only" — POW
+    stays empty by design, matching the original Axelera/DeepX-style
+    no-power pattern.
     """
 
     HISTORY_MAX = 720      # default; overridable via __init__
     MAX_MPUS = 16          # driver reserves temp1..temp16
 
     def __init__(self, bdf, verbose=False, history_max=None,
-                 hwmon_path=None):
+                 hwmon_path=None, device_id=0):
         self.bdf = bdf
         self.pcie = pcie_info(bdf) or {}
         self.identity = {"board_name": "MemryX MX3"}
@@ -1243,39 +1266,155 @@ class MemryXProbe:
         self.hwmon_path = hwmon_path   # optional explicit override
         self._populated_idxs = []
 
-        self._open()
+        # SDK state. Populated by _open_sdk(); used by poll().
+        # device_id: the SDK's per-host MX3 module index (0 for the
+        # first/only module). TODO multi-module: derive from `bdf`
+        # by matching `device_info_t` entries to the PCI BDF when
+        # multiple MX3s are present on one host.
+        self.device_id = device_id
+        self._mxa = None             # memryx.mxa module reference
+        self._sdk_version = None     # memryx.__version__
+        self._has_power = False      # True iff get_power() returned OK
 
-        # Build the metrics list AFTER _open() populates
-        # self._populated_idxs (typically 4 on M-4 SKU, 2 on
-        # M-2 SKU, 0 on probe failure). Power slot first to
-        # align visually with Hailo's POW slot (always None on
-        # MX3 — keeps panel layout consistent).
+        # Snapshot of SDK extras (clock, voltage, thermal state, power
+        # alert) captured on each poll for --once display; not graphed.
+        # Clock frequency is a state indicator (which boost mode is
+        # active), not a metric to graph over time — it lives here
+        # rather than as a Metric.
+        self.last_snapshot = None
+
+        self.history_power = deque(maxlen=self.history_max)
+        self.history_t = []   # populated in _open() after sensor scan
+
+        # state_flags: list of (label, deque) pairs. The TUI renders
+        # them inline as `<LABEL> [state]` badges. Same-prefix labels
+        # (e.g. THERMAL_0..THERMAL_3) are visually grouped by the TUI
+        # into one bracket. The CSV writer emits each as a per-flag
+        # column. Distinct from `metrics` because flags are enum state
+        # indicators (not graphed as time-series, not rendered as
+        # inline bars).
         #
-        # Color order mirrors AxeleraProbe's choice for the first
-        # 4 sensors (TOTAL/TEMP/OK/POWER): MemryX has POW empty
-        # so reusing CP_TRACE_POWER for the 4th MPU is safe.
+        # Per-chip thermal throttle state comes from the vendor sysfs
+        # node `/sys/memx<N>/temperature` (parsed in _read_throttle()).
+        # The SDK's `get_thermal_state(device_id)` only returns one
+        # module-wide value (no chip_id arg) — effectively the OR of
+        # these per-chip latches — so sysfs is the only source for
+        # per-chip granularity and we use it unconditionally (no SDK
+        # dependency for thermal). Power alert remains SDK-only.
+        self._hist_thermal_states = []  # per-chip; populated after _open()
+        self._hist_power_alert    = deque(maxlen=self.history_max)
+        self.state_flags = []   # populated below
+
+        self._open()          # hwmon discovery + identity + temps
+        self._open_sdk()      # memryx import + power capability check
+
+        # Probe the per-chip throttle-state count from the vendor
+        # sysfs file. Falls back to len(self._populated_idxs) (i.e.
+        # one slot per populated hwmon temp) when the sysfs file is
+        # unreadable; that mirrors the chip count anyway.
+        self._n_throttle_chips = self._probe_throttle_chip_count()
+
+        # Build the metrics list AFTER both _open() and _open_sdk():
+        # we need _populated_idxs (T-count) and _has_power (POW
+        # presence). Layout principle: power slot first to align
+        # with Hailo's POW slot; per-MPU temps after.
+        #
+        # Color order is chosen so adjacent metrics on the inline-bars
+        # row read distinctly: POW=cyan, then T's cycle through
+        # magenta/yellow/green/red.
         _T_COLORS = (CP_TRACE_TOTAL,   # T0 magenta — pipeline input
                      CP_TRACE_TEMP,    # T1 yellow
                      CP_OK,            # T2 green
-                     CP_TRACE_POWER,   # T3 cyan (POW empty on MX3)
-                     CP_CRIT)          # T4+ red, if future denser SKU
-        self.history_power = deque(maxlen=self.history_max)
+                     CP_CRIT,          # T3 red
+                     CP_ACCENT)        # T4+ cyan, if future denser SKU
+
         self.history_t = [deque(maxlen=self.history_max)
                           for _ in self._populated_idxs]
-        self.metrics = [
-            Metric("POW", self.history_power, "W", CP_TRACE_POWER),
-        ] + [
-            Metric(f"T{i}",
-                   self.history_t[i],
-                   "°C",
-                   _T_COLORS[i % len(_T_COLORS)])
-            for i in range(len(self._populated_idxs))
-        ]
+        self.metrics = []
+        # POW slot is always present for panel alignment — but its
+        # values are only non-None when SDK power capability exists.
+        self.metrics.append(
+            Metric("POW", self.history_power, "W", CP_TRACE_POWER))
+        for i in range(len(self._populated_idxs)):
+            self.metrics.append(
+                Metric(f"T{i}",
+                       self.history_t[i],
+                       "°C",
+                       _T_COLORS[i % len(_T_COLORS)]))
+        # state_flags assembly:
+        #   - THERMAL_<i> (one per chip) from sysfs — always present
+        #     when the sysfs file is readable.
+        #   - POWER (module-level) from SDK — only when get_power()
+        #     capability is confirmed.
+        # The TUI groups THERMAL_0..N-1 into a single THERMAL widget;
+        # CSV emits one column per per-chip flag plus a POWER column.
+        self._hist_thermal_states = [deque(maxlen=self.history_max)
+                                     for _ in range(self._n_throttle_chips)]
+        for i in range(self._n_throttle_chips):
+            self.state_flags.append(
+                (f"THERMAL_{i}", self._hist_thermal_states[i]))
+        if self._has_power:
+            self.state_flags.append(("POWER", self._hist_power_alert))
+
+    @property
+    def state_prefix(self):
+        """Tuple `(label, value_str)` rendered as the leading
+        `LABEL value` pair on the status row before the state-flag
+        badges — for MemryX, the current clock frequency.
+
+        Returns `None` when no SDK reading is available; the TUI then
+        omits the prefix entirely and the row starts with the first
+        flag badge. Clock isn't graphed (it's a power-mode indicator,
+        not a load-varying metric), so it lives here rather than as a
+        Metric — matches the user's "CLK is not a metric" feedback.
+        """
+        snap = self.last_snapshot
+        if not snap:
+            return None
+        freq = snap.get("frequency_mhz")
+        if freq is None:
+            return None
+        return ("CLOCK", f"{freq:.0f}MHz")
 
     def _log(self, msg):
         """Print a probe-scoped diagnostic to stderr when --verbose."""
         if self._verbose:
             print(f"[MemryXProbe {self.bdf}] {msg}", file=sys.stderr)
+
+    def _read_throttle(self):
+        """Read per-chip ThermalThrottlingState from /sys/memx<N>/temperature.
+
+        Returns a list of int throttle states (one per chip, in CHIP()
+        index order), or None on any read/parse error. The sysfs file
+        format is human-readable, one line per chip; we extract the
+        ThermalThrottlingState field via MEMRYX_SYSFS_RE.
+        """
+        path = MEMRYX_SYSFS_FMT.format(self.device_id)
+        try:
+            with open(path) as f:
+                raw = f.read()
+        except OSError:
+            return None
+        # Order by CHIP(N) index so we don't depend on file line order.
+        per_chip = {}
+        for m in MEMRYX_SYSFS_RE.finditer(raw):
+            per_chip[int(m.group(1))] = int(m.group(2))
+        if not per_chip:
+            return None
+        return [per_chip[i] for i in sorted(per_chip)]
+
+    def _probe_throttle_chip_count(self):
+        """Determine how many CHIP() entries the sysfs file exposes,
+        for sizing per-chip state_flags up front. Falls back to the
+        hwmon-populated temp-sensor count when sysfs is unreadable —
+        those should match on real hardware."""
+        states = self._read_throttle()
+        if states is not None:
+            return len(states)
+        fallback = len(self._populated_idxs)
+        self._log(f"sysfs throttle file unreadable, falling back to "
+                  f"hwmon count = {fallback}")
+        return fallback
 
     def _find_hwmon_for_bdf(self):
         """Scan /sys/class/hwmon for an entry matching self.bdf.
@@ -1336,9 +1475,7 @@ class MemryXProbe:
             "board_name": "MemryX MX3",
             "arch": f"M2 ({n}-chip)",
             "product_name": f"MemryX MX3-2280-M-{n}",
-            "description": (f"hwmon={os.path.basename(self.hwmon_path)}, "
-                            f"temp1..temp{self._populated_idxs[-1]} "
-                            f"populated"),
+            "description": f"hwmon={os.path.basename(self.hwmon_path)}",
             "serial": None,
             "part_number": None,
         }
@@ -1346,11 +1483,55 @@ class MemryXProbe:
         self._log(f"opened: hwmon={self.hwmon_path}, "
                   f"populated_temps={self._populated_idxs}")
 
+    def _open_sdk(self):
+        """Detect memryx SDK + per-device power capability.
+
+        Three outcomes:
+        - SDK absent (memryx not installed): _has_power stays False,
+          POW metric still listed but values stay None.
+        - SDK present but get_power() raises / returns nonsense on
+          this device_id: same fallback.
+        - SDK present + get_power() returns a number: _has_power=True,
+          metrics include POW + CLK with real values from poll().
+        """
+        try:
+            import memryx as _memryx
+            self._mxa = _memryx.mxa
+            self._sdk_version = getattr(_memryx, "__version__", "?")
+        except Exception as e:
+            self._log(f"memryx SDK not importable; POW disabled: "
+                      f"{type(e).__name__}: {e}")
+            return
+        # Try a power read directly — the simplest capability check.
+        # The MxAccl.can_get_power_consumption() method works too but
+        # requires constructing an MxAccl with a DFP, which is heavy
+        # and unnecessary here.
+        try:
+            p = self._mxa.get_power(self.device_id)
+            if isinstance(p, (int, float)) and p >= 0:
+                self._has_power = True
+                self._log(f"SDK {self._sdk_version} loaded, power "
+                          f"capability OK (initial {p} mW)")
+            else:
+                self._log(f"SDK power query returned non-numeric: "
+                          f"{p!r}; POW disabled")
+        except Exception as e:
+            self._log(f"SDK power query raised; POW disabled: "
+                      f"{type(e).__name__}: {e}")
+        if self._has_power:
+            # Augment identity with SDK version + capability flag
+            desc = self.identity.get("description", "")
+            self.identity["description"] = (
+                f"{desc}, SDK={self._sdk_version}, power=supported")
+
     def poll(self):
         if not self.device:
             for d in self.history_t:
                 d.append(None)
             self.history_power.append(None)
+            for d in self._hist_thermal_states:
+                d.append(None)
+            self._hist_power_alert.append(None)
             return None, None
         temps = []
         for idx, deq in zip(self._populated_idxs, self.history_t):
@@ -1363,16 +1544,62 @@ class MemryXProbe:
                 v = None
             temps.append(v)
             deq.append(v)
-        self.history_power.append(None)   # MX3 doesn't expose power via hwmon
-        return temps, None
+        # Per-chip throttle state from /sys/memx<N>/temperature.
+        # Independent of SDK — works as soon as the driver is loaded.
+        throttles = self._read_throttle()
+        for i, d in enumerate(self._hist_thermal_states):
+            d.append(throttles[i] if (throttles is not None
+                                      and i < len(throttles)) else None)
+        # SDK readings — power (mW→W) to history, clock/volt to
+        # last_snapshot, power_alert enum to state_flags history (for
+        # CSV) and last_snapshot (for --once).
+        if self._has_power and self._mxa is not None:
+            p_w = clk = volt = pwr_alert = None
+            try:
+                p_w = self._mxa.get_power(self.device_id) / 1000.0
+            except Exception:
+                pass
+            try:
+                clk = float(self._mxa.get_frequency(self.device_id, 0))
+            except Exception:
+                pass
+            try:
+                volt = self._mxa.get_voltage(self.device_id)
+            except Exception:
+                pass
+            try:
+                pwr_alert = self._mxa.get_poweralert(self.device_id)
+            except Exception:
+                pass
+            self.history_power.append(p_w)
+            self._hist_power_alert.append(pwr_alert)
+            self.last_snapshot = {
+                "voltage_mv": volt,
+                "thermal_states": list(throttles) if throttles else None,
+                "power_alert": pwr_alert,
+                "frequency_mhz": clk,
+            }
+        else:
+            self.history_power.append(None)
+            self._hist_power_alert.append(None)
+            # Still record per-chip throttle for --once even without SDK
+            self.last_snapshot = {
+                "thermal_states": list(throttles) if throttles else None,
+            }
+        return temps, (self.history_power[-1]
+                       if self.history_power else None)
 
     def reset_history(self):
         for d in self.history_t:
             d.clear()
         self.history_power.clear()
+        for d in self._hist_thermal_states:
+            d.clear()
+        self._hist_power_alert.clear()
 
     def close(self):
-        # Pure sysfs reads — nothing to release.
+        # Pure sysfs + SDK function calls — nothing to release. SDK
+        # is module-level; we don't own any handles.
         self.device = None
 
 
@@ -1415,7 +1642,10 @@ class PMD2Probe:
     PCIE_RAIL_INDICES = [7, 8, 9]
     PCIE_RAIL_COLORS = [CP_TRACE_POWER, CP_OK, CP_TRACE_TEMP]
 
-    POWER_MAX = 10.0
+    # TOTAL_MAX is per-metric (TOTAL goes to ~100 W on a workstation;
+    # PCIE rails sit in the 1-10 W range, controlled by TUI's
+    # --power-max). PMD2 TOTAL keeps its own scale via max_val on
+    # the metric, so this constant is used.
     TOTAL_MAX = 100.0
 
     def __init__(self, port_path, verbose=False, history_max=None):
@@ -1603,8 +1833,6 @@ class INA228Probe:
 
     HISTORY_MAX = 720  # default; overridable via __init__
 
-    POWER_MAX = 10.0
-
     _STANDARD_RAILS = [
         (1.05, "1.05V"), (1.2, "1.2V"), (1.5, "1.5V"), (1.8, "1.8V"),
         (3.3, "3.3V"), (5.0, "5V"), (12.0, "12V"),
@@ -1746,11 +1974,14 @@ class INA228Probe:
             return
 
         self._addresses = list(ok_addrs)
+        # Note: per-metric max_val intentionally left as None so the
+        # TUI's --power-max (passed to TUI.POWER_MAX) governs the axis
+        # cap. Setting max_val=self.POWER_MAX here would have hardcoded
+        # 10 W and made --power-max unreachable for INA228 readings.
         self.metrics = [
             Metric(f"P{self.ADDR_TO_INDEX.get(addr, '?')}",
                    self._hist_pow[addr], "W",
-                   self.PER_ADDR_COLOR.get(addr, CP_TRACE_POWER),
-                   max_val=self.POWER_MAX)
+                   self.PER_ADDR_COLOR.get(addr, CP_TRACE_POWER))
             for addr in ok_addrs
         ]
 
@@ -2004,6 +2235,13 @@ class TUI:
             for p in self.probes:
                 for m in (getattr(p, "metrics", None) or []):
                     cols.append(f"{p.bdf}_{m.label}")
+                # state_flags: extra per-flag columns (enum-valued —
+                # e.g. THERMAL, POWER for MemryX). Not part of
+                # `metrics` because they're state indicators, not
+                # graphed time-series.
+                for label, _hist in (getattr(p, "state_flags", None)
+                                     or []):
+                    cols.append(f"{p.bdf}_{label}")
             try:
                 self._csv_file.write(",".join(cols) + "\n")
             except (OSError, ValueError):
@@ -2016,6 +2254,10 @@ class TUI:
             for m in (getattr(p, "metrics", None) or []):
                 v = m.history[-1] if m.history else None
                 row.append("" if v is None else f"{v:.6f}")
+            for _label, hist in (getattr(p, "state_flags", None) or []):
+                v = hist[-1] if hist else None
+                # Integer-valued enums; write without trailing zeros
+                row.append("" if v is None else f"{int(v)}")
         try:
             self._csv_file.write(",".join(row) + "\n")
         except (OSError, ValueError):
@@ -2085,11 +2327,24 @@ class TUI:
         self._draw_identity(stdscr, y0, width, probe, idx)
         if slot_rows >= 2:
             self._draw_stats(stdscr, y0 + 1, width, probe)
-        if slot_rows >= 3:
-            self._draw_inline_bars(stdscr, y0 + 2, width, probe)
 
-        graph_y = y0 + 3
-        graph_h = slot_rows - 3 - 1  # reserve 1 for time axis
+        # Optional state-flag row, ABOVE the inline bars so the
+        # module-level "STATUS[<MHz> THERMAL POWER]" indicator sits
+        # next to the identity / stats header rather than buried
+        # between the bars and the graph. Only present when the probe
+        # declares non-empty `state_flags` (e.g. MemryX with SDK
+        # power telemetry). Costs 1 row of graph height.
+        flags = getattr(probe, "state_flags", None) or []
+        has_flags = bool(flags) and slot_rows >= 4
+        flag_row = 1 if has_flags else 0
+        if has_flags:
+            self._draw_state_flags(stdscr, y0 + 2, width, probe)
+
+        if slot_rows >= 3 + flag_row:
+            self._draw_inline_bars(stdscr, y0 + 2 + flag_row, width, probe)
+
+        graph_y = y0 + 3 + flag_row
+        graph_h = slot_rows - 3 - 1 - flag_row  # reserve 1 for time axis
         if graph_h < 3:
             return
         if self.user_graph_rows is not None:
@@ -2097,6 +2352,128 @@ class TUI:
         self._draw_graph_box(stdscr, graph_y, 0, width, graph_h, probe)
         time_y = graph_y + graph_h
         self._draw_time_axis(stdscr, time_y, 0, width, graph_h)
+
+    def _draw_state_flags(self, stdscr, y, width, probe):
+        """Render the state row as `CLOCK <value>  THERMAL [ OK  OK  OK  OK ]  POWER [ OK ]`.
+
+        Format (left-aligned at column 0, lining up with identity /
+        stats rows):
+
+          <PREFIX_LABEL> <prefix_value>  <FLAG_LABEL> [<state> ...]  ...
+
+        - Labels (`CLOCK`, `THERMAL`, `POWER`, ...) render bold-cyan
+          (`CP_ACCENT`), matching the `PRODUCT / DESCRIPTION` style
+          on the stats row above.
+        - The optional prefix value (e.g. `850MHz`) renders dim.
+        - Brackets `[` `]` render dim — pure scaffolding so the
+          state badges inside pop out.
+        - Each state badge renders bold:
+            val == 0     → green ` OK `
+            val != 0     → red   `ALERT`
+            val is None  → dim   ` -- `
+          ` OK ` and ` -- ` keep the spaces around them so a single
+          `[ OK ]` doesn't look cramped next to `[ALERT]`.
+
+        **Group-by-prefix**: state_flags entries whose labels match
+        the pattern `PREFIX_<digit>` (e.g. `THERMAL_0`, `THERMAL_1`,
+        `THERMAL_2`, `THERMAL_3`) collapse to a single widget with
+        multiple per-chip badges inside one bracket:
+          `THERMAL [ OK  OK  OK  OK ]`
+        Each inner badge is colored independently from its chip's
+        state. CSV still emits one column per per-chip flag.
+
+        Prefix contract: `probe.state_prefix` is either `None`, a
+        tuple `(label, value_str)`, or a zero-arg callable returning
+        either of those. A bare string is accepted as a fallback —
+        rendered as `STATUS <value>`.
+        """
+        flags = getattr(probe, "state_flags", None) or []
+        prefix = getattr(probe, "state_prefix", None)
+        if callable(prefix):
+            try:
+                prefix = prefix()
+            except Exception:
+                prefix = None
+        if not flags and not prefix:
+            return
+
+        accent = curses.color_pair(CP_ACCENT) | curses.A_BOLD
+        dim = curses.color_pair(CP_DIM)
+        x = 0  # left-aligned, like identity / stats rows
+
+        if prefix is not None:
+            if isinstance(prefix, tuple) and len(prefix) == 2:
+                p_label, p_value = prefix
+            else:
+                p_label, p_value = "STATUS", str(prefix)
+            p_value = str(p_value)
+            chunk = f"{p_label} "
+            if x + len(chunk) + len(p_value) >= width:
+                return
+            _safe_addstr(stdscr, y, x, chunk, accent); x += len(chunk)
+            _safe_addstr(stdscr, y, x, p_value, dim); x += len(p_value)
+
+        # Group consecutive flags whose labels share a `PREFIX_<digit>`
+        # form into one widget. Non-matching labels render alone.
+        groups = self._group_state_flags(flags)
+
+        def badge(val):
+            if val is None:
+                return " -- ", CP_DIM
+            if val == 0:
+                return " OK ", CP_OK
+            return "ALERT", CP_CRIT
+
+        for label, hists in groups:
+            states = [badge(h[-1] if h else None) for h in hists]
+            # Total width: "  LABEL [s0  s1 ... sN-1]"
+            sep = "  " if x > 0 else ""
+            head_len = len(sep) + len(label) + 1 + 1  # "<sep><label> ["
+            inner_len = sum(len(s[0]) for s in states) \
+                        + 2 * (len(states) - 1)        # two-space separators
+            tail_len = 1
+            if x + head_len + inner_len + tail_len > width:
+                break
+            _safe_addstr(stdscr, y, x, f"{sep}{label} ", accent)
+            x += len(sep) + len(label) + 1
+            _safe_addstr(stdscr, y, x, "[", dim); x += 1
+            for i, (text, color) in enumerate(states):
+                if i > 0:
+                    _safe_addstr(stdscr, y, x, "  ", dim); x += 2
+                _safe_addstr(stdscr, y, x, text,
+                             curses.color_pair(color) | curses.A_BOLD)
+                x += len(text)
+            _safe_addstr(stdscr, y, x, "]", dim); x += 1
+
+    _GROUP_RE = re.compile(r"^(.*)_(\d+)$")
+
+    def _group_state_flags(self, flags):
+        """Collapse consecutive `PREFIX_<digit>` labels into a single
+        widget. Returns a list of `(display_label, [hist, ...])` where
+        non-grouped labels yield a single-element history list."""
+        groups = []
+        i = 0
+        n = len(flags)
+        while i < n:
+            label, hist = flags[i]
+            m = self._GROUP_RE.match(label)
+            if m:
+                prefix = m.group(1)
+                hists = [hist]
+                j = i + 1
+                while j < n:
+                    m2 = self._GROUP_RE.match(flags[j][0])
+                    if m2 and m2.group(1) == prefix:
+                        hists.append(flags[j][1])
+                        j += 1
+                    else:
+                        break
+                groups.append((prefix, hists))
+                i = j
+            else:
+                groups.append((label, [hist]))
+                i += 1
+        return groups
 
     def _draw_identity(self, stdscr, y, width, probe, idx):
         """Line 1: `Device N [BDF Board HAILO8]  PCIe x4/x4 @ 8.0GT/s`."""
@@ -2134,7 +2511,7 @@ class TUI:
         bracket += "]"
         _safe_addstr(stdscr, y, x, bracket, dim | curses.A_BOLD); x += len(bracket)
 
-        label_cp = curses.color_pair(CP_ACCENT)
+        label_cp = curses.color_pair(CP_ACCENT) | curses.A_BOLD
         crit = curses.color_pair(CP_CRIT) | curses.A_BOLD
 
         if pcie.get("current_link_width") or pcie.get("max_link_width"):
@@ -2165,7 +2542,7 @@ class TUI:
             return
 
         dim = curses.color_pair(CP_DIM)
-        label_cp = curses.color_pair(CP_ACCENT)
+        label_cp = curses.color_pair(CP_ACCENT) | curses.A_BOLD
         ident = probe.identity
         fields = [
             ("PRODUCT",     ident.get("product_name")),
@@ -2185,13 +2562,25 @@ class TUI:
             _safe_addstr(stdscr, y, x, value, dim); x += len(value)
 
     def _metric_max(self, probe, metric):
-        """Pick the axis cap for a metric."""
+        """Pick the axis cap for a metric.
+
+        Priority:
+          1. metric.max_val if set per-metric (e.g. PMD2 TOTAL = 100 W,
+             which is legitimately a different scale from PCIE rails)
+          2. The TUI's TEMP_MAX / POWER_MAX, which the user controls
+             via --temp-max / --power-max.
+
+        Probe-class POWER_MAX is intentionally NOT consulted —
+        otherwise a probe-class default would shadow the user's
+        explicit CLI flag, which is exactly what users don't expect
+        from a `--power-max` argument.
+        """
         if metric.max_val is not None:
             return metric.max_val
         if metric.unit == "°C":
             return self.TEMP_MAX
         if metric.unit == "W":
-            return getattr(probe, "POWER_MAX", self.POWER_MAX)
+            return self.POWER_MAX
         return 100.0
 
     def _draw_inline_bars(self, stdscr, y, width, probe):
@@ -2546,11 +2935,20 @@ def parse_args(argv=None):
         help=("Full-scale current for INA228 calibration (amps). "
               "Determines the per-LSB current resolution — smaller "
               "numbers give cleaner readings within their range. "
+              "When the actual current exceeds this calibration, the "
+              "INA228 latches its current-overflow flag and `power` "
+              "reads as 0.0 W until the flag clears — a reading of "
+              "exactly 0.0 W during a high-load workload usually "
+              "means you need to raise this value. "
               "Default 5 A is sized for Hailo-8 / Metis M.2 (peak ~1.5 A "
               "and ~4.5 A respectively on the 3.3 V rail) with ~10%% "
-              "headroom. Raise to 10 A for higher-TDP cards or to "
-              "match the 0.015 Ω shunt's measurable ceiling. Shared "
-              "across all INA228s on the bus."))
+              "headroom. **Use at least 10 A for MemryX MX3 in 20T "
+              "boost mode** — steady-state is ~4 A but transient inrush "
+              "during ramp-up exceeds 5 A and triggers the overflow "
+              "latch. The 0.015 Ω shunt's hard ceiling is ~10.9 A "
+              "(±163.84 mV input range / 0.015 Ω); beyond that the "
+              "analog front-end clips. Shared across all INA228s "
+              "on the bus."))
     parser.add_argument(
         "--ina228-addresses", type=_addr_list, default=None,
         metavar="LIST",
@@ -2639,6 +3037,25 @@ def do_snapshot(probes):
             tag = busy if (m is p.metrics[-1]) else ""
             print(f"    {m.label.lower():<10}= {v_s}{tag}")
         snap = getattr(p, "last_snapshot", None)
+        # MemryX schema: voltage + frequency + per-chip thermal
+        # throttle states + module-level power-alert
+        if snap and ("thermal_states" in snap or "power_alert" in snap):
+            volt = snap.get("voltage_mv")
+            freq = snap.get("frequency_mhz")
+            if volt is not None:
+                print(f"    volt      = {volt} mV")
+            if freq is not None:
+                print(f"    freq      = {freq:.0f} MHz")
+            ts_list = snap.get("thermal_states")
+            pa = snap.get("power_alert")
+            if ts_list:
+                tags = ["OK" if v == 0 else "ALERT" for v in ts_list]
+                pretty = " ".join(f"chip{i}:{int(v)}({t})"
+                                  for i, (v, t) in enumerate(zip(ts_list, tags)))
+                print(f"    thermal   = {pretty}")
+            if pa is not None:
+                state = "OK" if pa == 0 else "ALERT"
+                print(f"    pwr_alert = {int(pa)} ({state})")
         if snap and "rails" in snap:
             for r in snap["rails"]:
                 print(f"    rail {r['name']:<6}= "
@@ -2666,11 +3083,17 @@ def do_snapshot(probes):
 
 
 def write_csv_snapshot(csv_file, probes):
-    """Write one CSV header + one CSV row to `csv_file`."""
+    """Write one CSV header + one CSV row to `csv_file`.
+
+    Same schema as the TUI's `_csv_emit` (one column per metric, plus
+    one column per state_flag) — keep these two paths in sync.
+    """
     cols = ["time"]
     for p in probes:
         for m in (getattr(p, "metrics", None) or []):
             cols.append(f"{p.bdf}_{m.label}")
+        for label, _hist in (getattr(p, "state_flags", None) or []):
+            cols.append(f"{p.bdf}_{label}")
     csv_file.write(",".join(cols) + "\n")
     ts = datetime.now().isoformat(timespec="milliseconds")
     row = [ts]
@@ -2678,6 +3101,9 @@ def write_csv_snapshot(csv_file, probes):
         for m in (getattr(p, "metrics", None) or []):
             v = m.history[-1] if m.history else None
             row.append("" if v is None else f"{v:.6f}")
+        for _label, hist in (getattr(p, "state_flags", None) or []):
+            v = hist[-1] if hist else None
+            row.append("" if v is None else f"{int(v)}")
     csv_file.write(",".join(row) + "\n")
 
 

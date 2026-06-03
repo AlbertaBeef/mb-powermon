@@ -13,7 +13,7 @@ Power and temperature measurement utility for edge AI NPUs.
 | `hailo`     | Hailo-8 / 8L / 8R PCIe + M.2 modules                                     | `POW`, `TS0`, `TS1` (both on-die temperature sensors) |
 | `axelera`   | Axelera Metis M.2                                                        | `SYS` (module/system PVT) + `AI0`–`AI3` (per-AIPU-core PVT) via `triton_trace`; power not exposed on M.2 |
 | `deepx`     | DeepX M1 M.2 (PCI vendor `0x1ff4`)                                       | `T0`/`T1`/`T2` (per-NPU temperature) via `dxrt-cli -s`; power not exposed on M1 |
-| `memryx`    | MemryX MX3 M.2 (MX3-2280-M-4 = 4-chip, MX3-2280-M-2 = 2-chip)            | `T0`…`T(N-1)` (per-MPU temperature, N autodetected from sensor population) via Linux hwmon (`name="memx0"`); power not exposed via hwmon |
+| `memryx`    | MemryX MX3 M.2 (MX3-2280-M-4 = 4-chip, MX3-2280-M-2 = 2-chip)            | `T0`…`T(N-1)` (per-MPU temperature) via Linux hwmon (`name="memx0"`) + `POW` (chip power) via `memryx.mxa.get_power()` when the MX3 SDK is installed; status row `CLOCK <MHz>  THERMAL [ OK  OK  OK  OK ]  POWER [ OK ]` surfaces the current clock frequency, **per-chip** thermal-throttle latches (parsed from `/sys/memx0/temperature`), and the module-level power-alert (`[ OK ]` green, `[ALERT]` red) |
 | `elmorlabs` | ElmorLabs PMD2 (USB CDC, VID:PID `0483:5740`)                            | `PCIE1/2/3`, `TOTAL`; 10 rails dumped in `--once`    |
 | `adafruit`  | Up to 4× Adafruit INA228 power monitors on an Adafruit FT232H USB→I²C bridge (`0403:6014`) | One `P<n>` trace per detected sensor; auto-classifies rail voltage (`P1` → `P1(3.3V)`) |
 
@@ -56,7 +56,7 @@ python3 mb-powermon.py --verbose
 | `hailo`     | [`hailo_platform`](https://hailo.ai/) (HailoRT runtime + Python bindings) |
 | `axelera`   | `axelera.runtime` Python package + the `triton_trace` binary (auto-located on `$PATH` or `/opt/axelera/runtime-*/bin`) |
 | `deepx`     | The `dxrt-cli` binary (DXRT 3.2.0+, auto-located on `$PATH` or `/usr/local/bin/dxrt-cli`) — telemetry only, no Python SDK needed for the probe |
-| `memryx`    | The `memx-drivers` apt package (registers a Linux hwmon node at `/sys/class/hwmon/hwmonN/` with `name="memx0"`) — pure sysfs reads, no SDK, no daemon, no root |
+| `memryx`    | The `memx-drivers` apt package (registers a Linux hwmon node at `/sys/class/hwmon/hwmonN/` with `name="memx0"`) for per-MPU temperatures — no root needed. Optional: the MemryX MX3 SDK (`memryx.mxa`) for chip power, voltage, clock, and thermal/power-alert state. With the SDK absent, the probe still works in temperature-only mode |
 | `elmorlabs` | `pyserial`                                                               |
 | `adafruit`  | `adafruit-blinka`, `adafruit-circuitpython-ina228`, `pyftdi`             |
 
@@ -64,11 +64,30 @@ If a probe's SDK isn't installed, devices of that type render with an `ERROR` ro
 
 ### ASPM readings
 
-Reading the PCI Express Capability's Link Control register (for the ASPM field) requires access past byte 64 of `/sys/bus/pci/devices/<BDF>/config`. Run as root, or configure passwordless `sudo` so the tool can escalate via `sudo -n cat`. Otherwise the field shows `<needs root or sudo -n>`.
+Reading the PCI Express Capability's Link Control register (for the ASPM field) requires access past byte 64 of `/sys/bus/pci/devices/<BDF>/config`, which is gated by the kernel's `CAP_SYS_ADMIN` capability — unprivileged readers get a 64-byte truncation. Without escalation the field shows `<needs root or sudo -n>`.
+
+The probe transparently retries via `sudo -n cat <config>`, so the **recommended fix is a narrow sudoers entry** that grants passwordless read access to PCI config space and nothing else:
+
+```sh
+# /etc/sudoers.d/mb-powermon-aspm   (chmod 0440, edit via `sudo visudo -f ...`)
+abbeefai ALL=(root) NOPASSWD: /usr/bin/cat /sys/bus/pci/devices/*/config
+```
+
+Replace `abbeefai` with your username. After installing the file, `mb-powermon.py` (run as your normal user) will show `ASPM L0s L1` instead of the truncation placeholder.
+
+**Don't run the whole tool under `sudo`.** Vendor SDKs (Hailo, MemryX, Axelera, Adafruit FT232H) live in your user venv; `sudo python3 mb-powermon.py` falls back to the system Python and silently loses every SDK-dependent probe — the INA228 path in particular returns 0 devices because `scan_adafruit_devices()` can't import `adafruit_ina228`. If you absolutely need to run as root (e.g. for a one-off test), invoke the venv's interpreter explicitly: `sudo /path/to/venv/bin/python3 mb-powermon.py`.
 
 ### FT232H + INA228
 
 The Adafruit probe sets `BLINKA_FT232H=1` so Blinka uses the FT232H USB→I²C backend. By default it scans the four canonical INA228 addresses `{0x40, 0x41, 0x44, 0x45}` and instantiates one sensor per responding address. Override with `--ina228-addresses`.
+
+If `pyftdi` enumeration fails with `no langid (permission issue, no string descriptors)`, the `/dev/bus/usb/...` node for **any** FTDI device on the bus has restrictive permissions — pyftdi walks every `0403:*` device during scan and trips on the first one it can't read. Run the bundled helper to install a vendor-wide udev rule that covers all current and future FTDI peripherals:
+
+```bash
+./fix-ftdi-permissions.sh
+```
+
+The rule is `SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", MODE="0666"`, which is broader than just the FT232H (`0403:6014`) — it also covers FT2232H/FT4232H breakouts and the FT4232HL on AMD ZCU104 boards. Script is idempotent and safe to re-run; udev applies new modes on `add` events, so a stubborn device may need an unplug-replug cycle.
 
 ## Output
 
@@ -76,10 +95,24 @@ Each device renders as a panel with:
 
 1. **Identity line** — `Device N [BDF Board ARCH]  PCIe x4/x4 @ 8.0GT/s  ASPM L1`
 2. **Stats line** — product name, description, part number, serial (or `ERROR` + reason)
-3. **Inline bars** — one per metric, color-coded
-4. **Time-series graph** — one trace per metric; y-axis caps from `--temp-max` / `--power-max` or per-metric overrides
+3. **Status line** (probes that expose state flags) — `<LABEL> value  <FLAG> [ OK ]  ...` with the badge inside each bracket bold-green ` OK ` / bold-red `ALERT` / dim ` -- `. Consecutive `PREFIX_<digit>` flags collapse into one widget (e.g. `THERMAL_0..THERMAL_3` → `THERMAL [ OK  OK  OK  OK ]`), one inner badge per chip. Today only MemryX populates this row; other probes skip it (no row cost).
+4. **Inline bars** — one per metric, color-coded
+5. **Time-series graph** — one trace per metric; y-axis caps from `--temp-max` / `--power-max` or per-metric overrides
 
-The `--csv` and `--once` outputs include the full per-rail PMD2 snapshot and per-sensor INA228 voltage/current, which the TUI omits to keep panels readable.
+The `--csv` and `--once` outputs include the full per-rail PMD2 snapshot and per-sensor INA228 voltage/current, which the TUI omits to keep panels readable. State-flag values (e.g. MemryX `<bdf>_THERMAL_0..3` and `<bdf>_POWER`) become extra integer columns in the CSV.
+
+### Troubleshooting: INA228 reads exactly `0.0` W during heavy load
+
+If your CSV / TUI shows an INA228 sensor reporting **exactly `0.000000` W** during a workload that's clearly drawing power (e.g. temperature climbs while power flat-lines at zero), it means the actual current has briefly exceeded `--ina228-max-current` and the INA228's current-overflow flag has latched. The chip's `power` register reports 0 W until the flag clears.
+
+**Fix:** re-run with a higher `--ina228-max-current`. The default 5 A is sized for Hailo-8 (~1.5 A peak) and Axelera Metis M.2 (~4.5 A peak), but **MemryX MX3 in 20T boost mode** routinely exceeds it during transient inrush at ramp-up (steady-state is ~4 A, transients can hit 8-12 A).
+
+```bash
+# Comfortable margin for MX3 20T mode
+python3 mb-powermon.py --ina228-max-current 10 --csv run.csv
+```
+
+The 0.015 Ω shunt's hard ceiling is ~10.9 A (the chip's ±163.84 mV input range / 0.015 Ω). To measure beyond that you'd need a smaller shunt.
 
 ## Plotting CSV runs
 
