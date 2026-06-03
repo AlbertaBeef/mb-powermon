@@ -787,11 +787,17 @@ class HailoProbe:
                 self._throttle_level_freq_mhz[int(n)] = f / 1e6
         # Order: thermal first (its level drives CLOCK), then temp-
         # protection-enable, then OCP zone + its protection-enable.
+        # TEMP_PROT and OCP_PROT use the 4-tuple "plain" form: white
+        # text (`_on_off_white_badge`), no brackets, no bold — they
+        # nearly always read ON at idle and the rare OFF transition
+        # is easier to spot as inline plain text than as a loud
+        # bracketed badge that visually competes with the more
+        # interesting THERMAL / OCP indicators.
         self.state_flags = [
             ("THERMAL",   self._hist_thermal_throttle, _hailo_thermal_badge),
-            ("TEMP_PROT", self._hist_temp_prot,        _on_off_badge),
+            ("TEMP_PROT", self._hist_temp_prot,        _on_off_white_badge, True),
             ("OCP",       self._hist_ocp_zone),
-            ("OCP_PROT",  self._hist_ocp_prot,         _on_off_badge),
+            ("OCP_PROT",  self._hist_ocp_prot,         _on_off_white_badge, True),
         ]
 
     @property
@@ -963,6 +969,13 @@ class AxeleraProbe:
         self._triton_trace = _find_triton_trace()
         self._verbose = verbose
         self.history_max = history_max or self.HISTORY_MAX
+        # Cached clock_profile (MHz) from
+        # axr.Context().read_device_configuration() — captured once at
+        # _open() since on Metis M.2 the clock is a boot-time config,
+        # not an adaptive runtime value. Surfaced as `state_prefix`
+        # so the panel header shows `CLOCK <MHz>` matching Hailo /
+        # MemryX / DeepX layout.
+        self._clock_mhz = None
 
         # Metis exposes 5 readings in triton_trace's `core_temps=[...]`
         # log line. Per Axelera's CONNECT documentation the order is:
@@ -1046,11 +1059,49 @@ class AxeleraProbe:
             }
             self._log(f"SDK device={self._device_name} arch={arch}")
             self._enable_collector()
+            self._read_clock(sdk_device)
         except Exception as e:
             msg = str(e).strip() or type(e).__name__
             self.error = msg[:60]
             self.device = None
             self._log(f"_open raised: {e}")
+
+    def _read_clock(self, sdk_device):
+        """Cache the configured clock_profile (MHz) once at init.
+
+        `axr.Context().read_device_configuration(dev)` returns 13
+        static config keys (clocks, throttle thresholds, MVM
+        utilization); `clock_profile` is the configured NN clock in
+        MHz. On Metis M.2 this is boot-time-set, not adaptive, so a
+        single read at init suffices. Best-effort: if axelera.runtime
+        isn't importable here or the field is missing, we silently
+        skip — the panel just doesn't get a CLOCK prefix.
+        """
+        try:
+            from axelera.runtime import objects as axr
+            ctx = axr.Context()
+            cfg = ctx.read_device_configuration(sdk_device)
+        except Exception as e:
+            self._log(f"read_device_configuration() raised: {e}")
+            return
+        clock = cfg.get("clock_profile")
+        if clock is None:
+            self._log("clock_profile not in device configuration")
+            return
+        try:
+            self._clock_mhz = float(clock)
+        except (TypeError, ValueError):
+            self._log(f"clock_profile not numeric: {clock!r}")
+            return
+        self._log(f"clock_profile = {self._clock_mhz:.0f} MHz")
+
+    @property
+    def state_prefix(self):
+        """`(label, value_str)` for the panel header's CLOCK prefix.
+        None if the clock_profile read failed at _open() time."""
+        if self._clock_mhz is None:
+            return None
+        return ("CLOCK", f"{self._clock_mhz:.0f}MHz")
 
     def _enable_collector(self):
         """Switch triton_trace collector logging to "inf" so --peek has
@@ -1182,6 +1233,14 @@ class DeepXProbe:
         r"^\s*NPU\s+(\d+)\s*:.*?temperature\s+([\d.]+)\s*'?\s*C",
         re.IGNORECASE,
     )
+    # Same line, capturing the per-NPU clock in MHz. Run as a separate
+    # pattern (rather than extending _NPU_LINE_PAT to require both
+    # clock and temperature in one match) so an SDK version that
+    # changes the line order doesn't break temperature parsing.
+    _CLOCK_LINE_PAT = re.compile(
+        r"^\s*NPU\s+(\d+)\s*:.*?clock\s+([\d.]+)\s*MHz",
+        re.IGNORECASE,
+    )
 
     def __init__(self, bdf, verbose=False, history_max=None):
         self.bdf = bdf
@@ -1199,6 +1258,13 @@ class DeepXProbe:
         self.history_t = [deque(maxlen=self.history_max)
                           for _ in range(self.NPU_COUNT)]
         self.history_power = deque(maxlen=self.history_max)
+        # Live NN clock from `dxrt-cli -s`. All three M1 NPU cores
+        # report the same value (board-level clock), so we cache the
+        # most-recent first-NPU reading for the `state_prefix` CLOCK
+        # widget. The skill notes voltage/clock are documented as
+        # "static constants" on M1 — but they're still re-parsed each
+        # poll, in case a future firmware ever varies them under load.
+        self._clock_mhz = None
 
         # POW first to align visually with Hailo's POW slot (always
         # None on M1), then T0..T(N-1) in distinct colors.
@@ -1315,10 +1381,20 @@ class DeepXProbe:
             return None
         text = res.stdout.decode("utf-8", errors="replace")
         by_idx = {}
+        clocks = []
         for line in text.splitlines():
             m = self._NPU_LINE_PAT.match(line)
             if m:
                 by_idx[int(m.group(1))] = float(m.group(2))
+            mc = self._CLOCK_LINE_PAT.match(line)
+            if mc:
+                try:
+                    clocks.append(float(mc.group(2)))
+                except (TypeError, ValueError):
+                    pass
+        if clocks:
+            # All cores report the same clock — first reading is fine.
+            self._clock_mhz = clocks[0]
         if not by_idx:
             self._status_fail_count += 1
             if (self._status_fail_count == 5
@@ -1334,6 +1410,15 @@ class DeepXProbe:
         self._status_fail_count = 0
         self._status_fail_logged = False
         return [by_idx.get(i) for i in range(self.NPU_COUNT)]
+
+    @property
+    def state_prefix(self):
+        """`(label, value_str)` for the panel header's CLOCK prefix.
+        None until the first successful `dxrt-cli -s` parse populates
+        `self._clock_mhz`."""
+        if self._clock_mhz is None:
+            return None
+        return ("CLOCK", f"{self._clock_mhz:.0f}MHz")
 
     def reset_history(self):
         for d in self.history_t:
@@ -2286,6 +2371,28 @@ def _default_state_badge(val):
     return "ALERT", CP_CRIT, 0
 
 
+def _on_off_white_badge(val):
+    """White ON / OFF formatter for de-emphasized feature-enable flags.
+
+    Returns plain-white text (`CP_DIM`) with no `A_BOLD` and no extra
+    attrs — the rendering caller is expected to detect this via the
+    entry's `plain` flag (4-tuple `state_flags` form) and skip both
+    brackets and the implicit `A_BOLD` overlay. Used for Hailo's
+    `TEMP_PROT` and `OCP_PROT` once we noticed they normally read ON
+    at idle and the ON/OFF transition is rare enough to not deserve
+    the loud bracketed-badge styling — they read as low-key trailing
+    text rather than alarm indicators.
+
+    Widths: `ON ` (3 chars with trailing space) and `OFF` (3 chars) so
+    consecutive plain entries align visually.
+    """
+    if val is None:
+        return "-- ", CP_DIM, 0
+    if val != 0:
+        return "ON ", CP_DIM, 0
+    return "OFF", CP_DIM, 0
+
+
 def _on_off_badge(val):
     """ON / OFF formatter for feature-enable flags where `1 = ON = green`
     and `0 = OFF = red`.
@@ -2544,16 +2651,18 @@ class TUI:
         if slot_rows >= 2:
             self._draw_stats(stdscr, y0 + 1, width, probe)
 
-        # Optional state-flag row, ABOVE the inline bars so the
-        # module-level "STATUS[<MHz> THERMAL POWER]" indicator sits
-        # next to the identity / stats header rather than buried
-        # between the bars and the graph. Only present when the probe
-        # declares non-empty `state_flags` (e.g. MemryX with SDK
-        # power telemetry). Costs 1 row of graph height.
+        # Optional status row, ABOVE the inline bars so the per-probe
+        # status info (CLOCK prefix + state-flag badges) sits next to
+        # the identity / stats header rather than buried between the
+        # bars and the graph. Reserved when the probe declares EITHER
+        # a non-empty `state_flags` (e.g. Hailo / MemryX) OR a
+        # `state_prefix` (e.g. Axelera / DeepX CLOCK with no flags).
+        # Costs 1 row of graph height.
         flags = getattr(probe, "state_flags", None) or []
-        has_flags = bool(flags) and slot_rows >= 4
-        flag_row = 1 if has_flags else 0
-        if has_flags:
+        has_prefix = bool(getattr(probe, "state_prefix", None))
+        has_status = (bool(flags) or has_prefix) and slot_rows >= 4
+        flag_row = 1 if has_status else 0
+        if has_status:
             self._draw_state_flags(stdscr, y0 + 2, width, probe)
 
         if slot_rows >= 3 + flag_row:
@@ -2633,65 +2742,89 @@ class TUI:
         # form into one widget. Non-matching labels render alone.
         groups = self._group_state_flags(flags)
 
-        for label, entries in groups:
+        for label, entries, plain in groups:
             states = [_format_state_badge(fmt, h[-1] if h else None)
                       for h, fmt in entries]
-            # Total width: "  LABEL [s0  s1 ... sN-1]"
             sep = "  " if x > 0 else ""
-            head_len = len(sep) + len(label) + 1 + 1  # "<sep><label> ["
+            # Plain widgets skip the surrounding `[ ]` brackets entirely.
+            # Width budget changes accordingly: "  LABEL s0  s1 ..."
+            # rather than "  LABEL [s0  s1 ...]".
+            head_len = (len(sep) + len(label) + 1
+                        + (0 if plain else 1))  # "<sep><label> " [+ "["]
             inner_len = sum(len(s[0]) for s in states) \
-                        + 2 * (len(states) - 1)        # two-space separators
-            tail_len = 1
+                        + 2 * (len(states) - 1)  # two-space separators
+            tail_len = 0 if plain else 1
             if x + head_len + inner_len + tail_len > width:
                 break
+            # Label always renders bold-cyan; the "(" / ")" bracket
+            # styling and the bold-overlay on the value are what plain
+            # mode suppresses.
             _safe_addstr(stdscr, y, x, f"{sep}{label} ", accent)
             x += len(sep) + len(label) + 1
-            _safe_addstr(stdscr, y, x, "[", dim); x += 1
+            if not plain:
+                _safe_addstr(stdscr, y, x, "[", dim); x += 1
+            bold = 0 if plain else curses.A_BOLD
             for i, (text, color, attrs) in enumerate(states):
                 if i > 0:
                     _safe_addstr(stdscr, y, x, "  ", dim); x += 2
                 _safe_addstr(stdscr, y, x, text,
-                             curses.color_pair(color) | curses.A_BOLD | attrs)
+                             curses.color_pair(color) | bold | attrs)
                 x += len(text)
-            _safe_addstr(stdscr, y, x, "]", dim); x += 1
+            if not plain:
+                _safe_addstr(stdscr, y, x, "]", dim); x += 1
 
     _GROUP_RE = re.compile(r"^(.*)_(\d+)$")
 
     def _group_state_flags(self, flags):
         """Collapse consecutive `PREFIX_<digit>` labels into a single
-        widget. Returns a list of `(display_label, [(hist, formatter), ...])`
+        widget. Returns a list of `(display_label, [(hist, formatter), ...], plain)`
         — non-grouped labels yield a single-element list. Each
-        `state_flags` entry may be either `(label, hist)` (binary OK/
-        ALERT via the default formatter, `formatter=None` here) or
-        `(label, hist, formatter)` where formatter is
-        `value -> (text, color_pair_id, attrs)`."""
+        `state_flags` entry may be:
+        - `(label, hist)` — 2-tuple, binary OK/ALERT via default
+          formatter (`formatter=None` here, `plain=False`).
+        - `(label, hist, formatter)` — 3-tuple, custom formatter,
+          standard bracketed-and-bold rendering.
+        - `(label, hist, formatter, plain)` — 4-tuple. When
+          `plain=True` the renderer skips the surrounding `[ ]`
+          brackets AND skips the implicit `A_BOLD` overlay, producing
+          de-emphasized inline text. Used with `_on_off_white_badge`
+          for Hailo's `TEMP_PROT` / `OCP_PROT`.
+
+        For grouped entries (THERMAL_0..THERMAL_3 etc.), the group's
+        `plain` is the OR of its entries' `plain` — in practice every
+        entry in a group either is or isn't plain, since they share a
+        formatter; this is just defensive."""
         def _unpack(entry):
             if len(entry) == 2:
-                return entry[0], entry[1], None
-            return entry[0], entry[1], entry[2]
+                return entry[0], entry[1], None, False
+            if len(entry) == 3:
+                return entry[0], entry[1], entry[2], False
+            return entry[0], entry[1], entry[2], bool(entry[3])
 
         groups = []
         i = 0
         n = len(flags)
         while i < n:
-            label, hist, fmt = _unpack(flags[i])
+            label, hist, fmt, plain = _unpack(flags[i])
             m = self._GROUP_RE.match(label)
             if m:
                 prefix = m.group(1)
                 pairs = [(hist, fmt)]
+                group_plain = plain
                 j = i + 1
                 while j < n:
-                    label2, hist2, fmt2 = _unpack(flags[j])
+                    label2, hist2, fmt2, plain2 = _unpack(flags[j])
                     m2 = self._GROUP_RE.match(label2)
                     if m2 and m2.group(1) == prefix:
                         pairs.append((hist2, fmt2))
+                        group_plain = group_plain or plain2
                         j += 1
                     else:
                         break
-                groups.append((prefix, pairs))
+                groups.append((prefix, pairs, group_plain))
                 i = j
             else:
-                groups.append((label, [(hist, fmt)]))
+                groups.append((label, [(hist, fmt)], plain))
                 i += 1
         return groups
 
