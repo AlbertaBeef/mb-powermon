@@ -421,25 +421,41 @@ _TRITON_TRACE_CACHED = False
 _TRITON_TRACE_PATH = None
 
 
-def _find_triton_trace():
-    """Locate the triton_trace binary (used to peek Metis core temps).
+def _find_axelera_log_cli():
+    """Locate the Axelera device-log CLI (used to peek Metis core temps).
 
-    Cached after first call so we don't re-glob /opt on every probe.
-    Returns None when neither $PATH nor the standard install prefix
-    /opt/axelera/runtime-*/bin contains it.
+    Voyager SDK 1.6.0 renamed the binary ``triton_trace`` ->
+    ``axlogdevice`` and ships it in the venv's ``bin/`` rather than
+    under ``/opt/axelera/runtime-*/bin``. We prefer the 1.6.0 name,
+    fall back to the 1.5.3 name, and search (in order) $PATH, the
+    running interpreter's own bin dir (the active venv), and the
+    ``/opt`` install prefix.
+
+    This is only the *fallback* path: on 1.6.0 AxeleraProbe reads temps
+    through the in-process ``axelera.runtime`` log API instead, which
+    can't version-drift from the firmware the way the standalone binary
+    does. Cached after first call so we don't re-glob on every probe.
+    Returns None when the binary is nowhere to be found.
     """
     global _TRITON_TRACE_CACHED, _TRITON_TRACE_PATH
     if _TRITON_TRACE_CACHED:
         return _TRITON_TRACE_PATH
     _TRITON_TRACE_CACHED = True
     import shutil
-    path = shutil.which("triton_trace")
-    if path:
-        _TRITON_TRACE_PATH = path
-        return path
-    matches = sorted(glob.glob("/opt/axelera/runtime-*/bin/triton_trace"))
-    if matches:
-        _TRITON_TRACE_PATH = matches[-1]  # latest version wins
+    venv_bin = os.path.dirname(sys.executable)
+    for name in ("axlogdevice", "triton_trace"):
+        path = shutil.which(name)
+        if not path:
+            cand = os.path.join(venv_bin, name)
+            if os.path.exists(cand):
+                path = cand
+        if not path:
+            matches = sorted(glob.glob(f"/opt/axelera/runtime-*/bin/{name}"))
+            if matches:
+                path = matches[-1]  # latest version wins
+        if path:
+            _TRITON_TRACE_PATH = path
+            return path
     return _TRITON_TRACE_PATH
 
 
@@ -949,13 +965,30 @@ class AxeleraProbe:
 
     Power isn't exposed on Metis M.2 so the power history stays empty
     (TUI inline bar reads "--W" and the power trace is suppressed).
-    Temperatures come from `triton_trace --slog --peek`, which prints
-    the firmware's most recent collector log line; we enable the
-    collector once at startup with --slog-level inf:collector and
-    restore it to "err" on close to avoid leaking verbose logging.
+
+    Temperatures come from the firmware's `collector` log line
+    (`core_temps=[sys,ai0,ai1,ai2,ai3]`). We enable the collector once
+    at startup (log level `inf:collector` on the `sysctrl` source) and
+    restore it to `err` on close to avoid leaking verbose logging.
+
+    Two access paths, preferred in this order:
+      1. **In-process log API** (Voyager SDK 1.6.0+): `axr.Context()`
+         exposes `device_set_log_level()` / `device_peek_log()`. This
+         is preferred because it ships in the same wheel as the runtime
+         and therefore can't version-drift from the device firmware.
+      2. **CLI fallback** (`axlogdevice` on 1.6.0, `triton_trace` on
+         1.5.3): shell out to `<bin> --device NAME --slog --peek`.
+
+    Path (2) is what broke when device firmware was updated to v1.6.0
+    while the installed runtime CLI was still v1.5.3 — the binary
+    refused to run with "Version mismatch! Actual=v1.6.0
+    Expected=v1.5.3". Path (1) sidesteps that class of failure.
     """
 
     HISTORY_MAX = 720  # default; overridable via __init__
+    # Matches both the 1.5.3 line (`core_temps=[...]`) and the 1.6.0
+    # line (`collector: core_temps=[...]`) — the anchor is on the
+    # `core_temps=[` token, so the leading prefix is irrelevant.
     _TEMP_PAT = re.compile(r"core_temps=\[([\d,]+)\]")
 
     def __init__(self, bdf, sdk_device=None, verbose=False, history_max=None):
@@ -966,7 +999,13 @@ class AxeleraProbe:
         self.error = None
         self._device_name = None  # axelera "metis-X:Y:Z" name
         self._collector_enabled = False
-        self._triton_trace = _find_triton_trace()
+        # Cached axr.Context reused for the log API (temp collector) and
+        # the one-shot clock read. Created lazily in _get_ctx().
+        self._ctx = None
+        # True once temps are being read through the in-process 1.6.0+
+        # log API; False means we fell back to the CLI binary below.
+        self._log_api = False
+        self._log_cli = _find_axelera_log_cli()
         self._verbose = verbose
         self.history_max = history_max or self.HISTORY_MAX
         # Cached clock_profile (MHz) from
@@ -1066,6 +1105,26 @@ class AxeleraProbe:
             self.device = None
             self._log(f"_open raised: {e}")
 
+    def _get_ctx(self):
+        """Lazily create and cache an `axr.Context()`.
+
+        Reused for both the log API (temp collector) and the one-shot
+        clock read. A `DeviceInfo` obtained from any Context works with
+        any other Context — it's pure device identification, not an
+        open connection — so caching one here is safe even in borrow
+        mode where `self.device` came from the orchestrator's Context.
+        Returns None if `axelera.runtime` can't be imported.
+        """
+        if self._ctx is not None:
+            return self._ctx
+        try:
+            from axelera.runtime import objects as axr
+            self._ctx = axr.Context()
+        except Exception as e:
+            self._log(f"could not create axr.Context: {e}")
+            self._ctx = None
+        return self._ctx
+
     def _read_clock(self, sdk_device):
         """Cache the configured clock_profile (MHz) once at init.
 
@@ -1077,9 +1136,10 @@ class AxeleraProbe:
         isn't importable here or the field is missing, we silently
         skip — the panel just doesn't get a CLOCK prefix.
         """
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
         try:
-            from axelera.runtime import objects as axr
-            ctx = axr.Context()
             cfg = ctx.read_device_configuration(sdk_device)
         except Exception as e:
             self._log(f"read_device_configuration() raised: {e}")
@@ -1104,20 +1164,54 @@ class AxeleraProbe:
         return ("CLOCK", f"{self._clock_mhz:.0f}MHz")
 
     def _enable_collector(self):
-        """Switch triton_trace collector logging to "inf" so --peek has
-        recent temperature samples to surface. Diagnostics are logged
-        via _log() (visible only with --verbose)."""
-        if not self._triton_trace:
-            self._log("triton_trace not found (checked $PATH and "
-                      "/opt/axelera/runtime-*/bin); temperatures will "
-                      "read as --C")
+        """Enable `inf:collector` logging on the `sysctrl` source so a
+        subsequent peek surfaces recent `core_temps=[...]` samples.
+
+        Prefers the in-process log API (Voyager SDK 1.6.0+) and falls
+        back to the CLI binary. Diagnostics via _log() (--verbose)."""
+        # Path 1: in-process log API (1.6.0+). Preferred — ships in the
+        # runtime wheel so it can't version-lock against the firmware
+        # the way the standalone CLI does.
+        ctx = self._get_ctx()
+        if (ctx is not None
+                and hasattr(ctx, "device_set_log_level")
+                and hasattr(ctx, "device_peek_log")):
+            try:
+                ctx.device_set_log_level(self.device, "sysctrl",
+                                         "inf:collector")
+                self._log_api = True
+                self._collector_enabled = True
+                # The firmware emits one `core_temps=[...]` line per
+                # second; right after enabling, the buffer is empty. Warm
+                # up briefly so the very first poll (and `--once`) has a
+                # sample instead of reading `--C`. Bounded so a silent
+                # collector never stalls startup.
+                for _ in range(15):
+                    txt = ""
+                    try:
+                        txt = ctx.device_peek_log(self.device, "sysctrl") or ""
+                    except Exception:
+                        break
+                    if self._TEMP_PAT.search(txt):
+                        break
+                    time.sleep(0.1)
+                self._log("temp collector enabled via in-process log API")
+                return
+            except Exception as e:
+                self._log(f"log API collector enable failed, trying CLI: {e}")
+
+        # Path 2: CLI fallback (axlogdevice / triton_trace).
+        if not self._log_cli:
+            self._log("axelera log CLI not found (checked $PATH, venv bin, "
+                      "and /opt/axelera/runtime-*/bin) and log API "
+                      "unavailable; temperatures will read as --C")
             return
         if not self._device_name:
             self._log("no SDK device name; can't enable temp collector")
             return
         try:
             res = subprocess.run(
-                [self._triton_trace, "--device", self._device_name,
+                [self._log_cli, "--device", self._device_name,
                  "--slog-level", "inf:collector"],
                 capture_output=True, timeout=5
             )
@@ -1130,7 +1224,7 @@ class AxeleraProbe:
                       f"{err[:200]}")
             return
         self._collector_enabled = True
-        self._log(f"temp collector enabled (bin={self._triton_trace}, "
+        self._log(f"temp collector enabled (bin={self._log_cli}, "
                   f"device={self._device_name})")
 
     def poll(self):
@@ -1149,9 +1243,22 @@ class AxeleraProbe:
     _peek_fail_logged = False
 
     def _read_core_temps(self):
+        # Path 1: in-process log API (1.6.0+).
+        if self._log_api:
+            try:
+                text = self._get_ctx().device_peek_log(self.device, "sysctrl")
+            except Exception as e:
+                self._peek_fail_count += 1
+                if self._peek_fail_count == 5 and not self._peek_fail_logged:
+                    self._peek_fail_logged = True
+                    self._log(f"device_peek_log raised: {e}")
+                return None
+            return self._parse_core_temps(text or "")
+
+        # Path 2: CLI fallback (axlogdevice / triton_trace).
         try:
             res = subprocess.run(
-                [self._triton_trace, "--device", self._device_name,
+                [self._log_cli, "--device", self._device_name,
                  "--slog", "--peek"],
                 capture_output=True, timeout=3
             )
@@ -1169,7 +1276,15 @@ class AxeleraProbe:
                 self._log(f"--peek failed (rc={res.returncode}): "
                           f"{err[:200]}")
             return None
-        text = res.stdout.decode("utf-8", errors="replace")
+        return self._parse_core_temps(
+            res.stdout.decode("utf-8", errors="replace"))
+
+    def _parse_core_temps(self, text):
+        """Extract the latest `core_temps=[...]` list from peek output.
+
+        Shared by the log-API and CLI paths. Returns a list of ints, or
+        None (with rate-limited diagnostics) when no line matched.
+        """
         temps = None
         for line in text.splitlines():
             m = self._TEMP_PAT.search(line)
@@ -1181,7 +1296,7 @@ class AxeleraProbe:
                 self._peek_fail_logged = True
                 preview = text.strip().splitlines()
                 preview = preview[-5:] if preview else ["<empty>"]
-                self._log("--peek had no core_temps lines after 5 polls. "
+                self._log("peek had no core_temps lines after 5 polls. "
                           "Last output:")
                 for line in preview:
                     self._log(f"    {line}")
@@ -1196,16 +1311,24 @@ class AxeleraProbe:
         self.history_power.clear()
 
     def close(self):
-        if (self._collector_enabled and self._triton_trace
-                and self._device_name):
-            try:
-                subprocess.run(
-                    [self._triton_trace, "--device", self._device_name,
-                     "--slog-level", "err"],
-                    capture_output=True, timeout=5
-                )
-            except Exception:
-                pass
+        # Restore the collector to "err" so we don't leak verbose
+        # logging after exit — via whichever path enabled it.
+        if self._collector_enabled:
+            if self._log_api and self._ctx is not None:
+                try:
+                    self._ctx.device_set_log_level(self.device, "sysctrl",
+                                                   "err")
+                except Exception:
+                    pass
+            elif self._log_cli and self._device_name:
+                try:
+                    subprocess.run(
+                        [self._log_cli, "--device", self._device_name,
+                         "--slog-level", "err"],
+                        capture_output=True, timeout=5
+                    )
+                except Exception:
+                    pass
         self._collector_enabled = False
         self.device = None
 
