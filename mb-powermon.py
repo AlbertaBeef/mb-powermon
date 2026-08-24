@@ -38,8 +38,9 @@ Data sources
                 truth power), so the POW trace stays empty.
 - ElmorLabs PMD2: USB CDC (VID:PID 0483:5740) via pyserial.
                 Reads total power and individual rails
-                (ATX12V, ATX5V, ATX5VSB, ATX3.3V, EPS, HPWR, PCIE2/3).
-                Displays total and PCIE1/2/3 rails.
+                (ATX12V, ATX5V, ATX5VSB, ATX3.3V, HPWR1, EPS1/2,
+                PCIE1/2/3).
+                Displays total, PCIE1/2/3 and HPWR1 rails.
 - Adafruit:     1 to 4 INA228 high-precision power monitors over an
                 Adafruit FT232H breakout (USB→MPSSE I2C bridge,
                 VID:PID 0403:6014). Scans the canonical INA228
@@ -107,8 +108,8 @@ os.environ.setdefault("BLINKA_FT232H", "1")
 #   max_val  : optional per-metric axis cap. None means "fall back
 #              to the unit-based default" (TEMP_MAX / POWER_MAX).
 #              Use it when a metric needs a different scale from
-#              its peers — e.g. PMD2 TOTAL on a 200W axis while
-#              PCIE1/2/3 share the standard 10W axis.
+#              its peers — e.g. PMD2 TOTAL/HPWR1 on a 100W+ axis
+#              while PCIE1/2/3 share the standard 10W axis.
 Metric = namedtuple("Metric", "label history unit color_id max_val",
                     defaults=[None])
 
@@ -126,6 +127,7 @@ CP_TRACE_TEMP = 7   # temperature trace (yellow, nvtop's "GPU%" color)
 CP_TRACE_POWER = 8  # power trace (cyan, nvtop's "mem%" color)
 CP_FOOTER = 9       # bottom bar (black on green, nvtop-style)
 CP_TRACE_TOTAL = 10 # PMD2 TOTAL trace (magenta — distinct from rails)
+CP_TRACE_HPWR = 11  # PMD2 HPWR1 trace (blue — distinct from rails)
 
 
 @contextlib.contextmanager
@@ -1942,15 +1944,15 @@ class PMD2Probe:
     """ElmorLabs PMD2 power-measurement device probe.
 
     USB CDC (STM32 VID:PID 0483:5740) at 115200 baud. The TUI surfaces
-    three values: PCIE1, PCIE2, and PCIE3 rail power — the three slot
-    rails an AI accelerator AIC typically draws from. They share the
-    POW (watts) axis so a single graph window plots all three traces
-    in distinct colors.
+    PCIE1, PCIE2, and PCIE3 rail power — the three slot rails an AI
+    accelerator AIC typically draws from — on the shared --power-max
+    axis, plus HPWR1 (GPU 12VHPWR) and TOTAL on the high-power
+    max(TOTAL_MAX, --power-max) axis.
 
     The PMD2 also reports an STM32 internal Tchip but that's the
     measurement device's own MCU temperature — not the system or any
     accelerator — so it's deliberately suppressed (no temp metric).
-    The other 7 rails (ATX12V, ATX5V, ATX5VSB, ATX3.3V, HPWR1, EPS1/2) plus the
+    The other 6 rails (ATX12V, ATX5V, ATX5VSB, ATX3.3V, EPS1/2) plus the
     EPS/PCIe/MB/Total aggregates are still polled, parsed, and dumped
     by --once snapshots, but not graphed.
 
@@ -1974,16 +1976,28 @@ class PMD2Probe:
 
     RAIL_NAMES = ["ATX12V", "ATX5V", "ATX5VSB", "ATX3.3V", "HPWR1",
                   "EPS1", "EPS2", "PCIE1", "PCIE2", "PCIE3"]
-    PCIE_RAIL_INDICES = [7, 8, 9]
-    PCIE_RAIL_COLORS = [CP_TRACE_POWER, CP_OK, CP_TRACE_TEMP]
+    # Graphed subset of RAIL_NAMES, one row per rail:
+    # (rail index, trace color, high-power axis?). A single table —
+    # rather than parallel index/color lists — so a future rail can't
+    # desync its color or axis (zip over parallel lists truncates
+    # silently, dropping a trace with no error).
+    GRAPHED_RAILS = [
+        (7, CP_TRACE_POWER, False),  # PCIE1
+        (8, CP_OK,          False),  # PCIE2
+        (9, CP_TRACE_TEMP,  False),  # PCIE3
+        (4, CP_TRACE_HPWR,  True),   # HPWR1 (GPU 12VHPWR)
+    ]
 
-    # TOTAL_MAX is per-metric (TOTAL goes to ~100 W on a workstation;
-    # PCIE rails sit in the 1-10 W range, controlled by TUI's
-    # --power-max). PMD2 TOTAL keeps its own scale via max_val on
-    # the metric, so this constant is used.
+    # TOTAL_MAX is the floor of the high-power axis shared by TOTAL
+    # and HPWR1 (both ~100 W+ on a workstation; PCIE rails sit in the
+    # 1-10 W range on the --power-max axis). The effective cap is
+    # max(TOTAL_MAX, --power-max), so the CLI flag can raise it (e.g.
+    # --power-max 500 for a GPU on HPWR1) but never shrink it below
+    # the sane workstation default.
     TOTAL_MAX = 100.0
 
-    def __init__(self, port_path, verbose=False, history_max=None):
+    def __init__(self, port_path, verbose=False, history_max=None,
+                 power_max=None):
         self.bdf = port_path
         self.pcie = {}  # USB device — no PCIe info to render
         self.identity = {"board_name": "PMD2"}
@@ -1992,22 +2006,20 @@ class PMD2Probe:
         self._verbose = verbose
         self.history_max = history_max or self.HISTORY_MAX
 
-        self.history_temp = deque(maxlen=self.history_max)
-        self.history_power = deque(maxlen=self.history_max)
-
+        self._hi_max = max(self.TOTAL_MAX, power_max or 0.0)
         self.history_total = deque(maxlen=self.history_max)
-        self.history_pcie1 = deque(maxlen=self.history_max)
-        self.history_pcie2 = deque(maxlen=self.history_max)
-        self.history_pcie3 = deque(maxlen=self.history_max)
-        self._rail_histories = [
-            self.history_pcie1, self.history_pcie2, self.history_pcie3,
-        ]
+        self._rail_histories = [deque(maxlen=self.history_max)
+                                for _ in self.GRAPHED_RAILS]
         self.metrics = [
-            Metric("PCIE1", self.history_pcie1, "W", CP_TRACE_POWER),
-            Metric("PCIE2", self.history_pcie2, "W", CP_OK),
-            Metric("PCIE3", self.history_pcie3, "W", CP_TRACE_TEMP),
+            # hi_axis rails (HPWR1) are GPU-scale — share TOTAL's
+            # high-power axis
+            Metric(self.RAIL_NAMES[idx], hist, "W", color,
+                   max_val=self._hi_max if hi_axis else None)
+            for (idx, color, hi_axis), hist in zip(self.GRAPHED_RAILS,
+                                                   self._rail_histories)
+        ] + [
             Metric("TOTAL", self.history_total, "W", CP_TRACE_TOTAL,
-                   max_val=self.TOTAL_MAX),
+                   max_val=self._hi_max),
         ]
 
         self.last_snapshot = None
@@ -2060,7 +2072,7 @@ class PMD2Probe:
         self._log(f"opened (fw={fw})")
 
     def poll(self):
-        rail_powers = [None, None, None]
+        rail_powers = [None] * len(self.GRAPHED_RAILS)
         total_w = None
         if self.device is not None:
             try:
@@ -2072,7 +2084,8 @@ class PMD2Probe:
                 raw = b""
             if len(raw) == self._SENSOR_SIZE:
                 fields = struct.unpack(self._SENSOR_FMT, raw)
-                for i, rail_idx in enumerate(self.PCIE_RAIL_INDICES):
+                for i, (rail_idx, _color, _hi) in \
+                        enumerate(self.GRAPHED_RAILS):
                     base = 2 + rail_idx * 3
                     rail_powers[i] = fields[base + 2] / 1000.0
                 total_w = float(fields[35])
@@ -2438,6 +2451,7 @@ def _init_colors():
     curses.init_pair(CP_TRACE_POWER, curses.COLOR_CYAN, bg)
     curses.init_pair(CP_FOOTER, curses.COLOR_BLACK, curses.COLOR_GREEN)
     curses.init_pair(CP_TRACE_TOTAL, curses.COLOR_MAGENTA, bg)
+    curses.init_pair(CP_TRACE_HPWR, curses.COLOR_BLUE, bg)
 
 
 def _temp_color(t):
@@ -3041,8 +3055,9 @@ class TUI:
         """Pick the axis cap for a metric.
 
         Priority:
-          1. metric.max_val if set per-metric (e.g. PMD2 TOTAL = 100 W,
-             which is legitimately a different scale from PCIE rails)
+          1. metric.max_val if set per-metric (e.g. PMD2 TOTAL/HPWR1
+             = max(100 W, --power-max), legitimately a different
+             scale from the PCIE rails)
           2. The TUI's TEMP_MAX / POWER_MAX, which the user controls
              via --temp-max / --power-max.
 
@@ -3094,7 +3109,12 @@ class TUI:
         if interior_w < 1:
             return
         if len(text) > interior_w:
-            text = text[-interior_w:]
+            # Drop the "/max" suffix before hard-truncating: chopping
+            # leading digits renders a plausible-looking wrong value
+            # (e.g. "123.45W/500W" -> "5W/500W").
+            text = text.split("/", 1)[0]
+            if len(text) > interior_w:
+                text = text[-interior_w:]
         padded = text.rjust(interior_w)
 
         if val is None or max_val <= 0:
@@ -3296,7 +3316,7 @@ class TUI:
             "       (power not exposed on M1)",
             "    MemryX: per-MPU temp via Linux hwmon (memx0)",
             "       (power not exposed via hwmon — use INA228)",
-            "    PMD2:   PCIE1/2/3 + TOTAL rail power (USB CDC)",
+            "    PMD2:   PCIE1/2/3 + HPWR1 + TOTAL rail power (USB CDC)",
             "    Adafruit: 1–4× INA228 power monitors over Adafruit",
             "       FT232H USB→I2C bridge (one POW trace per",
             "       sensor; V/I in --once / --csv)",
@@ -3690,7 +3710,8 @@ def main(argv=None):
                                        history_max=history_max)
                            for b in memryx_bdfs],
         "elmorlabs": lambda: [PMD2Probe(p, verbose=args.verbose,
-                                        history_max=history_max)
+                                        history_max=history_max,
+                                        power_max=args.power_max)
                               for p in pmd2_ports],
         "adafruit": lambda: [INA228Probe(
             b, addresses=args.ina228_addresses,
