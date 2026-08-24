@@ -18,6 +18,7 @@ Recognized CSV columns:
     <device>_SYS                  — Axelera module/system PVT (°C)
     <device>_AI0, _AI1, ...       — Axelera per-AIPU-core PVT (°C)
     <device>_PCIE1, _PCIE2, ...   — PMD2 per-rail power (W)
+    <device>_HPWR1                — PMD2 GPU 12VHPWR rail power (W)
     <device>_TOTAL                — PMD2 aggregate power (W)
     adafruit-ft232h_*             — Adafruit FT232H power channels (W)
 
@@ -54,6 +55,7 @@ RAIL_COLORS = {
     "pcie1": "#534AB7",
     "pcie2": "#3478C2",
     "pcie3": "#A53860",
+    "hpwr1": "#D4691E",
 }
 
 LOG_OVERLAY_COLOR = "#BA7517"
@@ -64,10 +66,11 @@ LOG_OVERLAY_COLOR = "#BA7517"
 # ---------------------------------------------------------------------------
 
 # Matches column names like "0000:c6:00.0_POW", "device_TS0", "device_T2"
-# (DeepX per-NPU), "device_SYS" / "device_AI3" (Axelera per-core), or
-# "device_TOTAL" (PMD2 aggregate power).
+# (DeepX per-NPU), "device_SYS" / "device_AI3" (Axelera per-core),
+# "device_HPWR1" (PMD2 GPU 12VHPWR rail), or "device_TOTAL" (PMD2
+# aggregate power).
 _METRIC_RE = re.compile(
-    r"^(.+?)_(POW|TEMP|TS\d+|T\d+|SYS|AI\d+|PCIE\d+|TOTAL)$"
+    r"^(.+?)_(POW|TEMP|TS\d+|T\d+|SYS|AI\d+|PCIE\d+|HPWR\d+|TOTAL)$"
 )
 
 
@@ -75,15 +78,15 @@ def _classify_metric(met):
     """Return 'power' or 'temp' for a metric kind, or None to skip.
 
     Power-like (plotted on the power chart):
-        pow, total, pcieN (PMD2 per-rail), and adafruit-ft232h_PN power
-        channels handled in parse_header().
+        pow, total, pcieN / hpwrN (PMD2 per-rail), and
+        adafruit-ft232h_PN power channels handled in parse_header().
     Temperature-like (plotted on the temperature chart):
         temp, sys (Axelera module sensor), tsN (Hailo on-die), tN (DeepX
         per-NPU), aiN (Axelera per-core).
     """
     if met in ("pow", "total"):
         return "power"
-    if re.match(r"^pcie\d+$", met):
+    if re.match(r"^(pcie|hpwr)\d+$", met):
         return "power"
     if met in ("temp", "sys"):
         return "temp"
